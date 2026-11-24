@@ -7,7 +7,7 @@
  *
  *   graphql_server [--address 127.0.0.1] [--port 8080] [--schema FILE]
  *                  [--bus session|system|none] [--tls]
- *                  [--cert FILE --key FILE]
+ *                  [--cert FILE --key FILE]   (--help lists the short forms)
  *
  * With --tls and no --cert/--key a throw-away self-signed certificate is
  * generated at start-up (the certificate is printed to stdout so clients can
@@ -15,6 +15,7 @@
  */
 #include "sample_data.hpp"
 #include "sutra/cert_generator.hpp"
+#include "sutra/command_line.hpp"
 #include "sutra/graphql/endpoint.hpp"
 #include "sutra/http_server.hpp"
 
@@ -22,8 +23,8 @@
 #include "sutra/graphql/dbus_source.hpp"
 #endif
 
-#include <charconv>
 #include <cstdio>
+#include <expected>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -49,75 +50,51 @@ struct Options
     std::string keyPath;
 };
 
-void usage()
+CommandLine makeCommandLine()
 {
-    std::fputs(
-        "usage: graphql_server [--address ADDR] [--port N] [--schema FILE]\n"
-        "                      [--bus session|system|none] [--tls]\n"
-        "                      [--cert FILE --key FILE]\n",
-        stderr);
+    CommandLine cmd;
+    cmd.addOption("--address,-a", "ADDR",
+                  "listen address (default 127.0.0.1, wildcards refused)");
+    cmd.addOption("--port,-p", "N", "listen port (default 8080)");
+    cmd.addOption("--schema,-s", "FILE",
+                  "schema JSON (default: the example schema.json)");
+    cmd.addOption("--bus,-b", "session|system|none",
+                  "D-Bus to read from (default system)");
+    cmd.addFlag("--tls,-t", "serve HTTPS");
+    cmd.addOption("--cert,-c", "FILE", "TLS certificate (PEM)");
+    cmd.addOption("--key,-k", "FILE", "TLS private key (PEM)");
+    cmd.addFlag("--help,-h", "show this help");
+    return cmd;
 }
 
-std::optional<Options> parseArgs(int argc, char** argv)
+/** @return the options, or an error message to print before the usage. */
+std::expected<Options, std::string> readOptions(const CommandLine& cmd)
 {
     Options options;
-    for (int i = 1; i < argc; ++i)
+    options.address = cmd.valueOr("--address", options.address);
+    options.schemaPath = cmd.valueOr("--schema", options.schemaPath);
+    options.bus = cmd.valueOr("--bus", options.bus);
+    options.tls = cmd.isSet("--tls");
+    options.certPath = cmd.valueOr("--cert", "");
+    options.keyPath = cmd.valueOr("--key", "");
+
+    auto port = cmd.number<uint16_t>("--port");
+    if (!port)
     {
-        std::string arg = argv[i];
-        if (arg == "--tls")
-        {
-            options.tls = true;
-            continue;
-        }
-        if (i + 1 >= argc)
-        {
-            return std::nullopt;
-        }
-        std::string value = argv[++i];
-        if (arg == "--address")
-        {
-            options.address = value;
-        }
-        else if (arg == "--port")
-        {
-            unsigned parsed = 0;
-            auto [end, ec] = std::from_chars(
-                value.data(), value.data() + value.size(), parsed);
-            if (ec != std::errc{} || end != value.data() + value.size() ||
-                parsed > 65535)
-            {
-                return std::nullopt;
-            }
-            options.port = static_cast<uint16_t>(parsed);
-        }
-        else if (arg == "--schema")
-        {
-            options.schemaPath = value;
-        }
-        else if (arg == "--bus")
-        {
-            if (value != "session" && value != "system" && value != "none")
-            {
-                return std::nullopt;
-            }
-            options.bus = value;
-        }
-        else if (arg == "--cert")
-        {
-            options.certPath = value;
-        }
-        else if (arg == "--key")
-        {
-            options.keyPath = value;
-        }
-        else
-        {
-            return std::nullopt;
-        }
+        return std::unexpected(port.error());
+    }
+    options.port = port->value_or(options.port);
+
+    if (options.bus != "session" && options.bus != "system" &&
+        options.bus != "none")
+    {
+        return std::unexpected("option '--bus' must be session, system or "
+                               "none, got '" +
+                               options.bus + "'");
     }
     if (options.certPath.empty() != options.keyPath.empty())
     {
-        return std::nullopt;
+        return std::unexpected("--cert and --key must be given together");
     }
     return options;
 }
@@ -138,13 +115,26 @@ std::optional<std::string> readFile(const std::string& path)
 
 int main(int argc, char** argv)
 {
-    auto parsed = parseArgs(argc, argv);
-    if (!parsed)
+    CommandLine cmd = makeCommandLine();
+    if (auto parsed = cmd.parse(argc, argv); !parsed)
     {
-        usage();
+        std::fprintf(stderr, "%s\n%s", parsed.error().c_str(),
+                     cmd.usage(argv[0]).c_str());
         return 2;
     }
-    const Options options = *parsed;
+    if (cmd.isSet("--help"))
+    {
+        std::fputs(cmd.usage(argv[0]).c_str(), stdout);
+        return 0;
+    }
+    auto parsedOptions = readOptions(cmd);
+    if (!parsedOptions)
+    {
+        std::fprintf(stderr, "%s\n%s", parsedOptions.error().c_str(),
+                     cmd.usage(argv[0]).c_str());
+        return 2;
+    }
+    const Options options = *parsedOptions;
 
     auto schema = graphql::Schema::fromFile(options.schemaPath);
     if (!schema)

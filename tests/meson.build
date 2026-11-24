@@ -10,6 +10,7 @@ test('spike_task_asio', spike, timeout: 30)
 sutra_tests = {
     'tcp_test': ['tcp_test.cpp'],
     'gather_test': ['gather_test.cpp'],
+    'command_line_test': ['command_line_test.cpp'],
     'http_test': ['http_test.cpp'],
     'web_client_test': ['web_client_test.cpp'],
     'graphql_parser_test': ['graphql_parser_test.cpp'],

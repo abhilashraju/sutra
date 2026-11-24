@@ -8,7 +8,7 @@ hops onto one) or on stdexec's own pools.
 
 | Layer | Header(s) |
 | --- | --- |
-| Basics | `config.hpp`, `log.hpp`, `spawn.hpp`, `wait_queue.hpp`, `gather.hpp` |
+| Basics | `config.hpp`, `log.hpp`, `spawn.hpp`, `wait_queue.hpp`, `gather.hpp`, `command_line.hpp` |
 | TCP / TLS | `connection.hpp`, `tcp_client.hpp`, `tcp_server.hpp`, `cert_generator.hpp` |
 | HTTP | `http_target.hpp`, `http_router.hpp`, `http_server.hpp`, `http_client.hpp` |
 | Pooling and retries | `connection_pool.hpp`, `web_client.hpp` |
@@ -95,6 +95,25 @@ Results keep input order. If a task fails, its siblings still run to
 completion and the first failure in input order is rethrown. A stop request is
 forwarded to the children and the gather completes as stopped. Everything stays
 on the calling io_context thread, so no locking is needed.
+
+`CommandLine` is a small declarative argument parser for programs built on
+sutra. It keeps coroserver's alias syntax and adds boolean flags,
+`--name=value`, and errors for unknown options, missing values and bad numbers
+(coroserver's `parseCommandline()` only handles `key value` pairs):
+
+```cpp
+CommandLine cmd;
+cmd.addOption("--port,-p", "N", "port to listen on");
+cmd.addFlag("--tls,-t", "serve HTTPS");
+if (auto parsed = cmd.parse(argc, argv); !parsed)
+{
+    std::fprintf(stderr, "%s\n%s", parsed.error().c_str(),
+                 cmd.usage(argv[0]).c_str());
+    return 2;
+}
+auto port = cmd.number<uint16_t>("--port");  // expected<optional<T>, string>
+bool tls = cmd.isSet("--tls");
+```
 
 ### TCP and TLS
 

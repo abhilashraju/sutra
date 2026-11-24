@@ -1,0 +1,122 @@
+{
+  "objects": [
+    {
+      "name": "Status",
+      "fields": [
+        { "name": "Health", "responseKey": "Health", "returnType": "String", "scalar": true },
+        { "name": "State",  "responseKey": "State",  "returnType": "String", "scalar": true }
+      ]
+    },
+    {
+      "name": "ServiceRoot",
+      "fields": [
+        { "name": "Id",             "responseKey": "Id",             "returnType": "String", "scalar": true },
+        { "name": "Name",           "responseKey": "Name",           "returnType": "String", "scalar": true },
+        { "name": "RedfishVersion", "responseKey": "RedfishVersion", "returnType": "String", "scalar": true }
+      ]
+    },
+    {
+      "name": "ProcessorSummary",
+      "fields": [
+        { "name": "Count", "responseKey": "Count", "returnType": "Int",    "scalar": true },
+        { "name": "Model", "responseKey": "Model", "returnType": "String", "scalar": true }
+      ]
+    },
+    {
+      "name": "ComputerSystem",
+      "fields": [
+        { "name": "Id",               "responseKey": "Id",               "returnType": "String", "scalar": true },
+        { "name": "Name",             "responseKey": "Name",             "returnType": "String", "scalar": true },
+        { "name": "PowerState",       "responseKey": "PowerState",       "returnType": "String", "scalar": true },
+        { "name": "Status",           "responseKey": "Status",           "returnType": "Status" },
+        { "name": "ProcessorSummary", "responseKey": "ProcessorSummary", "returnType": "ProcessorSummary" }
+      ]
+    },
+    {
+      "name": "Chassis",
+      "fields": [
+        { "name": "Id",           "responseKey": "Id",           "returnType": "String", "scalar": true },
+        { "name": "Name",         "responseKey": "Name",         "returnType": "String", "scalar": true },
+        { "name": "ChassisType",  "responseKey": "ChassisType",  "returnType": "String", "scalar": true },
+        { "name": "Manufacturer", "responseKey": "Manufacturer", "returnType": "String", "scalar": true },
+        { "name": "Model",        "responseKey": "Model",        "returnType": "String", "scalar": true },
+        { "name": "Status",       "responseKey": "Status",       "returnType": "Status" }
+      ]
+    },
+    {
+      "name": "IPv4Address",
+      "fields": [
+        { "name": "Address",    "responseKey": "Address",    "returnType": "String", "scalar": true },
+        { "name": "SubnetMask", "responseKey": "SubnetMask", "returnType": "String", "scalar": true },
+        { "name": "Gateway",    "responseKey": "Gateway",    "returnType": "String", "scalar": true }
+      ]
+    },
+    {
+      "name": "EthernetInterface",
+      "fields": [
+        { "name": "Id",            "responseKey": "Id",            "returnType": "String", "scalar": true },
+        { "name": "MACAddress",    "responseKey": "MACAddress",    "returnType": "String", "scalar": true },
+        { "name": "SpeedMbps",     "responseKey": "SpeedMbps",     "returnType": "Int",    "scalar": true },
+        { "name": "IPv4Addresses", "responseKey": "IPv4Addresses", "returnType": "IPv4Address", "isList": true },
+        { "name": "Status",        "responseKey": "Status",        "returnType": "Status" }
+      ]
+    },
+    {
+      "name": "Sensor",
+      "fields": [
+        { "name": "Id",              "responseKey": "Id",              "returnType": "String", "scalar": true },
+        { "name": "Name",            "responseKey": "Name",            "returnType": "String", "scalar": true },
+        { "name": "Reading",         "responseKey": "Reading",         "returnType": "Float",  "scalar": true },
+        { "name": "ReadingUnits",    "responseKey": "ReadingUnits",    "returnType": "String", "scalar": true },
+        { "name": "ReadingRangeMax", "responseKey": "ReadingRangeMax", "returnType": "Float",  "scalar": true },
+        { "name": "ReadingRangeMin", "responseKey": "ReadingRangeMin", "returnType": "Float",  "scalar": true },
+        { "name": "Status",          "responseKey": "Status",          "returnType": "Status" }
+      ]
+    }
+  ],
+
+  "queries": [
+    { "name": "serviceRoot", "returnType": "ServiceRoot", "source": "memory" },
+    { "name": "systems", "returnType": "ComputerSystem", "isList": true, "source": "memory" },
+    { "name": "system", "returnType": "ComputerSystem", "source": "memory",
+      "arguments": [{ "name": "id", "typeName": "ID", "required": true }] },
+    { "name": "chassis", "returnType": "Chassis", "isList": true, "source": "memory" },
+    { "name": "ethernetInterfaces", "returnType": "EthernetInterface", "isList": true, "source": "memory" },
+    { "name": "sensors", "returnType": "Sensor", "isList": true, "source": "memory" },
+    { "name": "sensor", "returnType": "Sensor", "source": "memory",
+      "arguments": [{ "name": "id", "typeName": "ID", "required": true }] },
+
+    { "name": "dbusSensors", "returnType": "Sensor", "isList": true, "source": "dbus",
+      "sourceConfig": {
+        "subtree": "/xyz/openbmc_project/sensors",
+        "interfaces": ["xyz.openbmc_project.Sensor.Value"],
+        "fields": {
+          "Id":              { "from": "path", "transform": "sensorId" },
+          "Name":            { "from": "path", "transform": "sensorName" },
+          "Reading":         { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Value" },
+          "ReadingUnits":    { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Unit", "transform": "sensorUnit" },
+          "ReadingRangeMax": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MaxValue" },
+          "ReadingRangeMin": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MinValue" },
+          "Status/State":    { "interface": "xyz.openbmc_project.State.Decorator.Availability", "property": "Available", "transform": "availableToState" },
+          "Status/Health":   { "interface": "xyz.openbmc_project.State.Decorator.OperationalStatus", "property": "Functional", "transform": "functionalToHealth" }
+        }
+      } },
+    { "name": "dbusSensor", "returnType": "Sensor", "source": "dbus",
+      "arguments": [{ "name": "id", "typeName": "ID", "required": true }],
+      "sourceConfig": {
+        "subtree": "/xyz/openbmc_project/sensors",
+        "interfaces": ["xyz.openbmc_project.Sensor.Value"],
+        "idKey": "Id", "idArg": "id",
+        "fields": {
+          "Id":              { "from": "path", "transform": "sensorId" },
+          "Name":            { "from": "path", "transform": "sensorName" },
+          "Reading":         { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Value" },
+          "ReadingUnits":    { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Unit", "transform": "sensorUnit" },
+          "ReadingRangeMax": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MaxValue" },
+          "ReadingRangeMin": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MinValue" },
+          "Status/State":    { "interface": "xyz.openbmc_project.State.Decorator.Availability", "property": "Available", "transform": "availableToState" },
+          "Status/Health":   { "interface": "xyz.openbmc_project.State.Decorator.OperationalStatus", "property": "Functional", "transform": "functionalToHealth" }
+        }
+      } }
+  ]
+}

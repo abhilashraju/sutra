@@ -1,0 +1,6 @@
+option('dbus', type: 'feature', value: 'auto',
+       description: 'Build the sdbusplus based D-Bus layer, its tests and the D-Bus data source')
+option('tests', type: 'feature', value: 'auto',
+       description: 'Build the GoogleTest based unit tests')
+option('examples', type: 'feature', value: 'enabled',
+       description: 'Build the example applications')

@@ -1,0 +1,263 @@
+# sutra
+
+Networking building blocks for C++23 on top of **std::execution**
+([stdexec](https://github.com/NVIDIA/stdexec)) and **Boost.Asio / Beast**.
+Every asynchronous operation is a sender; coroutines are `exec::task<T>`.
+There is no custom scheduler: work runs on an Asio executor (`onExecutor()`
+hops onto one) or on stdexec's own pools.
+
+| Layer | Header(s) |
+| --- | --- |
+| Basics | `config.hpp`, `log.hpp`, `spawn.hpp`, `wait_queue.hpp` |
+| TCP / TLS | `connection.hpp`, `tcp_client.hpp`, `tcp_server.hpp`, `cert_generator.hpp` |
+| HTTP | `http_target.hpp`, `http_router.hpp`, `http_server.hpp`, `http_client.hpp` |
+| Pooling and retries | `connection_pool.hpp`, `web_client.hpp` |
+| D-Bus (optional) | `dbus.hpp` |
+| GraphQL | `graphql/{parser,schema,executor,data_source,dbus_source,endpoint}.hpp` |
+
+## Requirements
+
+* GCC 14+ (developed with 15.2), C++23
+* meson >= 1.3, Boost >= 1.86 (headers), OpenSSL, nlohmann_json
+* **stdexec with Asio support** (see below)
+* optional: sdbusplus + libsystemd (D-Bus layer, GraphQL D-Bus source)
+* optional: GoogleTest (tests)
+
+### Installing stdexec with Asio support
+
+sutra needs `<exec/asio/use_sender.hpp>`, which stdexec installs only when it
+is configured for Asio:
+
+```sh
+git clone https://github.com/NVIDIA/stdexec && cd stdexec
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DSTDEXEC_ENABLE_ASIO=ON -DSTDEXEC_ASIO_IMPLEMENTATION=boost \
+      -DSTDEXEC_BUILD_TESTS=OFF -DSTDEXEC_BUILD_EXAMPLES=OFF \
+      -DCMAKE_INSTALL_PREFIX=$HOME/stdexec-install
+cmake --build build && cmake --install build
+```
+
+### Building
+
+```sh
+export CMAKE_PREFIX_PATH=$HOME/stdexec-install   # where stdexec was installed
+meson setup build .
+meson compile -C build
+meson test -C build --print-errorlogs
+```
+
+Options: `-Ddbus=enabled|disabled|auto`, `-Dtests=...`, `-Dexamples=...`.
+`scripts/build.sh` wraps these steps with the toolchain paths of the
+development host.
+
+Notes:
+
+* Do **not** define `BOOST_ASIO_DISABLE_THREADS`: stdexec's `use_sender`
+  relies on `std::recursive_mutex`. `sdbusplus.pc` injects that macro, so
+  `meson.build` links `libsdbusplus` and `libsystemd` directly instead of
+  using the pkg-config dependency.
+* `BOOST_ASIO_NO_DEPRECATED` is on (`steady_timer::cancel()` takes no
+  arguments).
+* Link `sutra_dep` for the core and `sutra_dbus_dep` for the D-Bus layer; the
+  latter defines `SUTRA_HAVE_DBUS=1` when sdbusplus is available.
+
+## API tour
+
+All snippets run inside a `Task<>` (an `exec::task`). Run one with
+`spawnTask(scope, task, "what")` on an `exec::async_scope`, then `ioc.run()`.
+
+### Basics (`config.hpp`)
+
+```cpp
+using namespace sutra;
+net::io_context ioc;
+exec::async_scope scope;
+
+net::steady_timer timer(ioc);
+timer.expires_after(10ms);
+co_await timer.async_wait(useSender);       // throws system_error on failure
+auto [ec] = co_await timer.async_wait(useSenderNoThrow);  // error as value
+```
+
+`WaitQueue` is a condition-variable-like primitive:
+`bool woken = co_await queue.wait(timeout);` with `notifyOne()` /
+`notifyAll()`.
+
+### TCP and TLS
+
+```cpp
+TcpServer server(ioc.get_executor(), "127.0.0.1", 9000,
+                 [](TcpConnection conn) -> Task<void> {
+                     std::string line = co_await conn.readUntil("\n");
+                     co_await conn.write(line);
+                 });
+server.start();                    // 0.0.0.0 / :: are refused
+
+TcpClient client(ioc.get_executor());
+co_await client.connect("127.0.0.1", "9000");
+```
+
+`Connection<Stream>` owns the read buffer and a watchdog: every operation has
+a timeout (`setTimeout`) and `run(initiate)` wraps any Beast operation.
+`cert_generator.hpp` creates self-signed PEMs and TLS 1.2+ contexts:
+`makeServerContext(cert, key)` and `makeClientContext(trustedPem)` (peer
+verification is always on; with an empty `trustedPem` the system store is
+used).
+
+### HTTP server and client
+
+```cpp
+HttpRouter router;
+router.get("/items/{id}", [](HttpRequest&, RequestContext& ctx) {
+    return jsonResponse(http::status::ok,
+                        "{\"id\":\"" + ctx.param("id") + "\"}");
+});
+router.post("/echo", [](HttpRequest& req, RequestContext&) -> Task<HttpResponse> {
+    co_return makeResponse(http::status::ok, req.body());
+});
+router.sse("/events", [](HttpRequest&, RequestContext&, SseWriter& out) -> Task<void> {
+    for (int i = 0; i < 3; ++i)
+        if (!co_await out.write("tick " + std::to_string(i))) co_return;
+});
+
+HttpServer server(ioc.get_executor(), endpoint, router);            // HTTP
+HttpServer tls(ioc.get_executor(), endpoint, router, serverCtx);    // HTTPS
+```
+
+`HttpServer` supports keep-alive, a body size limit and request timeouts
+(`HttpServerOptions`). `HttpClient` / `HttpsClient` are one connection each:
+`connect(host, port)`, `send(req)`, `subscribe(req, onEvent)` for SSE. HTTPS
+sends SNI and verifies the certificate against the host name.
+
+### Connection pool and `WebClient`
+
+```cpp
+auto pool = HttpConnectionPool::create(ioc.get_executor());  // 5/host, 30 s idle
+WebClient web(pool);
+auto res = co_await web.withUrl("http://127.0.0.1:8080/items?x=1")
+                       .withMethod(http::verb::get)
+                       .withRetries(3)
+                       .execute();
+auto json = co_await web.withUrl(...).executeJson();
+co_await web.withUrl(".../events").executeAsStream(
+    [](std::string event) { return true; /* false stops the stream */ });
+```
+
+* `ConnectionPoolConfig{maxConnectionsPerHost = 5, idleTimeout = 30 s,
+  acquireTimeout = 10 s, ...}`; `acquire()` waits (through a `WaitQueue`)
+  until a lease frees up and throws `timed_out` otherwise. Leases are RAII and
+  return to the pool unless marked bad. Idle connections expire and
+  connections closed by the peer are dropped before reuse.
+* HTTPS: `SecureWebClient` / `HttpsConnectionPool::create(executor, &ctx)`
+  with a `makeClientContext(...)`. Verification cannot be turned off.
+* Retry policy: connect errors are always retried; transport errors only for
+  idempotent verbs (or when a reused keep-alive connection was stale); 5xx
+  responses only for idempotent verbs. Exponential backoff; TLS and protocol
+  errors are never retried.
+
+### D-Bus (`dbus.hpp`, needs `SUTRA_HAVE_DBUS`)
+
+```cpp
+sdbusplus::asio::connection bus(ioc, sdbusplus::bus::new_system());
+auto state = co_await getProperty<std::string>(
+    bus, "xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0",
+    "xyz.openbmc_project.State.Host", "CurrentHostState");
+auto tree = co_await getSubTree(bus, "/xyz/openbmc_project/sensors", 0,
+                                {"xyz.openbmc_project.Sensor.Value"});
+```
+
+Same shape as the coroserver helpers: `dbusMethodCall<Ret...>`,
+`getProperty`, `setProperty`, `getAllProperties`, `callObjectMapperMethod`,
+`getSubTree`, `getObjects`, `getSubTreePaths`, the `getAssociated*` family,
+`getManagedObjects`, `introspect`. Failures throw `system_error`.
+
+### GraphQL (`graphql/`)
+
+* `Parser::parse/tryParse/validate` (queries, variables with defaults,
+  directives, named and inline fragments, depth limit 20).
+* `Schema` is JSON driven (`objects[]`, `queries[]`; see
+  `examples/graphql_server/schema.json`). Each root query names a `source`
+  and an optional `sourceConfig`.
+* `DataSource::fetch(FieldSpec, args) -> Task<Result<json>>`; register
+  sources in a `SourceRegistry`; `applySourceRegistry` drops (or rejects)
+  fields whose source is missing and validates the rest at start-up.
+  Built in: `MemorySource` and, with D-Bus, `DbusSource` (declarative
+  `sourceConfig`: subtree, interfaces, path/property mappings, transforms such
+  as `sensorId`, `sensorUnit`, `functionalToHealth`).
+* `Executor::execute(query, variables) -> Task<json>` returns `{"data":...}`
+  or `{"errors":[{"message":...}]}`.
+* `registerGraphqlEndpoint(router, executor, options)` adds
+  `POST /graphql` (JSON `{query, variables}` or `application/graphql`) and
+  `GET /graphql?query=&variables=`; query and variable sizes are limited
+  (`EndpointOptions`).
+
+```cpp
+auto schema = graphql::Schema::fromFile("schema.json");
+auto registry = std::make_shared<graphql::SourceRegistry>();
+registry->add("memory", memorySource);
+std::vector<std::string> warnings;
+graphql::applySourceRegistry(*schema, *registry, /*strict=*/true, warnings);
+auto executor = std::make_shared<graphql::Executor>(std::move(*schema), registry);
+graphql::registerGraphqlEndpoint(router, executor);
+```
+
+## Example: GraphQL server
+
+`examples/graphql_server` serves a Redfish-like schema over HTTP or HTTPS.
+
+```sh
+graphql_server --port 8080 --bus none            # in-memory data only
+graphql_server --port 8080 --bus system          # + live D-Bus sensors
+graphql_server --port 8443 --tls                 # self-signed cert on stdout
+graphql_server --tls --cert c.pem --key k.pem    # your own certificate
+curl -s localhost:8080/graphql -H 'Content-Type: application/json' \
+     -d '{"query":"{ sensors { Name Reading } }"}'
+```
+
+It binds to `127.0.0.1` by default and refuses wildcard addresses.
+`scripts/demo_graphql.sh` and `scripts/demo_graphql_dbus.sh` (the latter with
+`dbus-run-session` and `examples/graphql_server/demo_bus.py` as a fake
+ObjectMapper) reproduce the sessions used to test it.
+
+## Error and cancellation model
+
+* **Errors are exceptions inside tasks.** Failed I/O completes the sender
+  with an `exception_ptr` holding a `boost::system::system_error`
+  (`errorCodeOf(eptr)` extracts the code). Use `useSenderNoThrow` /
+  `net::as_tuple` when an error is part of normal control flow.
+* **Timeouts** are enforced per operation by the connection watchdog and
+  surface as `system_error(timed_out)`.
+* **Cancellation is the stopped channel.** A stop request on an operation's
+  environment cancels the pending Asio operation, which completes as
+  *stopped* (not as an error). `spawnTask` logs errors and swallows stops, so
+  stopping a server or an `exec::async_scope` unwinds all its sessions.
+  `TcpServer::stop()` / `HttpServer::stop()` close the listener and request
+  stop on all sessions.
+* A pending **D-Bus call cannot be revoked**; a stop is noticed when the
+  reply (or sdbusplus' own timeout) arrives.
+* **HTTP layer:** protocol violations answer 400/413/etc. and close the
+  connection; handler exceptions become `500` with a generic body (details go
+  to the log only).
+* **GraphQL:** invalid queries, validation failures and data-source failures
+  are reported in `errors` with HTTP 200; malformed HTTP requests (bad JSON,
+  oversized query, wrong types) get 400.
+
+## Differences from coroserver and limitations
+
+* Handlers and resolvers are `Task<>` (stdexec) instead of
+  `boost::asio::awaitable`.
+* GraphQL: queries only (no mutations or subscriptions), no introspection, no
+  `@skip/@include` evaluation, no `__typename`. The Redfish provider
+  (`redfishPath`, `expandMembers`, `collectionLink`) and the D-Bus
+  signal-watcher subscriptions of the coroserver example were not ported;
+  root fields resolve sequentially and `DbusSource` reads objects
+  sequentially (no `when_all` batching).
+* `WebClient` has no Redfish token-refresh helper.
+* TLS peer verification cannot be disabled by design.
+* `Connection` cannot interrupt a D-Bus call; Beast `tcp_stream` timers are
+  not used (they are unsafe with `use_sender`).
+* The tests run on Linux only; they are developed against stdexec 0.11.0.
+
+## License
+
+MIT.

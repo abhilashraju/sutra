@@ -4,3 +4,5 @@ option('tests', type: 'feature', value: 'auto',
        description: 'Build the GoogleTest based unit tests')
 option('examples', type: 'feature', value: 'enabled',
        description: 'Build the example applications')
+option('install_example', type: 'boolean', value: false,
+       description: 'Install the graphql_server example and its schema')

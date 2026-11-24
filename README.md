@@ -13,7 +13,7 @@ hops onto one) or on stdexec's own pools.
 | HTTP | `http_target.hpp`, `http_router.hpp`, `http_server.hpp`, `http_client.hpp` |
 | Pooling and retries | `connection_pool.hpp`, `web_client.hpp` |
 | D-Bus (optional) | `dbus.hpp` |
-| GraphQL | `graphql/{parser,schema,executor,data_source,dbus_source,endpoint}.hpp` |
+| GraphQL | `graphql/{parser,schema,executor,data_source,dbus_source,redfish_source,endpoint}.hpp` |
 
 ## Requirements
 
@@ -216,6 +216,18 @@ Same shape as the coroserver helpers: `dbusMethodCall<Ret...>`,
   Built in: `MemorySource` and, with D-Bus, `DbusSource` (declarative
   `sourceConfig`: subtree, interfaces, path/property mappings, transforms such
   as `sensorId`, `sensorUnit`, `functionalToHealth`).
+* `RedfishSource` (`"source": "redfish"`) reads a Redfish service through
+  `WebClient`. `sourceConfig` is `{"path": "/redfish/v1/Chassis/{chassisId}/Sensors",
+  "expandMembers": true}`: `{name}` placeholders are filled from the field's
+  arguments (percent-encoded, so an argument cannot add path segments or a
+  query; each must be a declared argument), `expandMembers` appends
+  `?$expand=*($levels=1)` to list fields. A collection whose members are bare
+  `@odata.id` links is followed (4 requests at a time; unreachable members are
+  skipped with a warning). The schema's `responseKey`s are Redfish property
+  names. `RedfishHttpBackend` / `RedfishHttpsBackend` (pooled, TLS verified
+  against `makeClientContext`) send `X-Auth-Token` or HTTP Basic credentials
+  (`RedfishCredentials`); implement `RedfishBackend` to supply another
+  transport.
 * `Executor::execute(query, variables) -> Task<json>` returns `{"data":...}`
   or `{"errors":[{"message":...}]}`.
 * `registerGraphqlEndpoint(router, executor, options)` adds
@@ -235,19 +247,32 @@ graphql::registerGraphqlEndpoint(router, executor);
 
 ## Example: GraphQL server
 
-`examples/graphql_server` serves a Redfish-like schema over HTTP or HTTPS.
+`examples/graphql_server` serves a Redfish-like schema over HTTP or HTTPS,
+backed by a Redfish service and, optionally, D-Bus.
 
 ```sh
-graphql_server --port 8080 --bus none            # in-memory data only
-graphql_server --port 8080 --bus system          # + live D-Bus sensors
+graphql_server --redfish https://bmc:443 --redfish-ca bmc-ca.pem \
+               --redfish-user root               # Redfish service (default
+                                                 # https://127.0.0.1:443)
+graphql_server --redfish http://127.0.0.1:9000   # plain-http Redfish
+graphql_server --bus system                      # + live D-Bus sensors
 graphql_server --port 8443 --tls                 # self-signed cert on stdout
 graphql_server --tls --cert c.pem --key k.pem    # your own certificate
 curl -s localhost:8080/graphql -H 'Content-Type: application/json' \
      -d '{"query":"{ sensors { Name Reading } }"}'
 ```
 
+Redfish is the default source: the example schema's `serviceRoot`, `systems`,
+`system`, `chassis`, `ethernetInterfaces`, `sensors` and `sensor` fields all
+read from the service given by `--redfish`. D-Bus is an optional addition:
+`--bus session|system` (default `none`) enables the `dbus*` fields; without it
+they are dropped at start-up. The Redfish token or password come from the
+environment (`SUTRA_REDFISH_TOKEN`, or `SUTRA_REDFISH_PASSWORD` together with
+`--redfish-user`), never from the command line.
+
 It binds to `127.0.0.1` by default and refuses wildcard addresses.
-`scripts/demo_graphql.sh` and `scripts/demo_graphql_dbus.sh` (the latter with
+`scripts/demo_graphql.sh` (with `examples/graphql_server/demo_redfish.py` as a
+fake Redfish service) and `scripts/demo_graphql_dbus.sh` (with
 `dbus-run-session` and `examples/graphql_server/demo_bus.py` as a fake
 ObjectMapper) reproduce the sessions used to test it.
 
@@ -279,14 +304,16 @@ ObjectMapper) reproduce the sessions used to test it.
 * Handlers and resolvers are `Task<>` (stdexec) instead of
   `boost::asio::awaitable`.
 * GraphQL: queries only (no mutations or subscriptions), no introspection, no
-  `@skip/@include` evaluation, no `__typename`. The Redfish provider
-  (`redfishPath`, `expandMembers`, `collectionLink`) and the D-Bus
-  signal-watcher subscriptions of the coroserver example were not ported.
+  `@skip/@include` evaluation, no `__typename`. The D-Bus
+  signal-watcher subscriptions of the coroserver example were not ported, and
+  the Redfish source has no `collectionLink` (a nested `@odata.id`
+  sub-collection inside a resource) or response cache.
 * Root fields, the objects of a D-Bus query and the interfaces of each object
   are resolved concurrently through `gather()` (at most 8 in flight per level;
   `Executor::setMaxConcurrentFields()` changes the root-field limit). Results
   keep query / mapper order.
-* `WebClient` has no Redfish token-refresh helper.
+* The Redfish source only reads (GET); there is no session login or token
+  refresh, so supply an existing token or Basic credentials.
 * TLS peer verification cannot be disabled by design.
 * `Connection` cannot interrupt a D-Bus call; Beast `tcp_stream` timers are
   not used (they are unsafe with `use_sender`).

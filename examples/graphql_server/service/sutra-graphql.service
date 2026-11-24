@@ -1,0 +1,25 @@
+[Unit]
+Description=Sutra GraphQL service (Redfish + D-Bus)
+After=network.target xyz.openbmc_project.ObjectMapper.service bmcweb.service
+Wants=xyz.openbmc_project.ObjectMapper.service
+
+[Service]
+Type=simple
+# GraphQL on 127.0.0.1:18081, Redfish source on https://127.0.0.1:443 (user
+# "service"), D-Bus source on the system bus.
+ExecStart=/usr/bin/graphql_server \
+    --address 127.0.0.1 --port 18081 \
+    --redfish https://127.0.0.1:443 \
+    --redfish-user service \
+    --schema /usr/share/sutra-graphql/schema.json \
+    --redfish-ca /etc/ssl/certs/https/server.pem \
+    --bus system
+# Holds the secret, never put it on the command line:
+#   SUTRA_REDFISH_PASSWORD=...
+# Create it with mode 0600, owned by root.
+EnvironmentFile=/etc/default/sutra-graphql
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

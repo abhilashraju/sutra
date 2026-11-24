@@ -2,21 +2,27 @@
  * @file main.cpp
  * @brief GraphQL server over HTTP(S) with a Redfish-like schema.
  *
- * Root fields come from the in-memory source ("memory") and, when built with
- * D-Bus support and a bus is reachable, from the live bus ("dbus").
+ * Root fields come from a Redfish service ("redfish", by default the one on
+ * https://127.0.0.1:443). With --bus session|system, and when built with
+ * D-Bus support, the live bus ("dbus") is added as an optional second source.
  *
  *   graphql_server [--address 127.0.0.1] [--port 8080] [--schema FILE]
+ *                  [--redfish URL] [--redfish-user NAME] [--redfish-ca FILE]
  *                  [--bus session|system|none] [--tls]
  *                  [--cert FILE --key FILE]   (--help lists the short forms)
+ *
+ * Redfish secrets are read from the environment, never from the command
+ * line: SUTRA_REDFISH_TOKEN (X-Auth-Token) or SUTRA_REDFISH_PASSWORD (with
+ * --redfish-user, HTTP Basic).
  *
  * With --tls and no --cert/--key a throw-away self-signed certificate is
  * generated at start-up (the certificate is printed to stdout so clients can
  * pin it with `curl --cacert`). The server refuses wildcard addresses.
  */
-#include "sample_data.hpp"
 #include "sutra/cert_generator.hpp"
 #include "sutra/command_line.hpp"
 #include "sutra/graphql/endpoint.hpp"
+#include "sutra/graphql/redfish_source.hpp"
 #include "sutra/http_server.hpp"
 
 #ifdef SUTRA_HAVE_DBUS
@@ -24,6 +30,7 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <expected>
 #include <fstream>
 #include <optional>
@@ -44,10 +51,13 @@ struct Options
     std::string address = "127.0.0.1";
     uint16_t port = 8080;
     std::string schemaPath = SUTRA_EXAMPLE_SCHEMA;
-    std::string bus = "system";
+    std::string redfishUrl = "https://127.0.0.1:443";
+    std::string bus = "none";
     bool tls = false;
     std::string certPath;
     std::string keyPath;
+    std::string redfishUser;
+    std::string redfishCa;
 };
 
 CommandLine makeCommandLine()
@@ -58,8 +68,15 @@ CommandLine makeCommandLine()
     cmd.addOption("--port,-p", "N", "listen port (default 8080)");
     cmd.addOption("--schema,-s", "FILE",
                   "schema JSON (default: the example schema.json)");
+    cmd.addOption("--redfish", "URL",
+                  "Redfish service to read from (default "
+                  "https://127.0.0.1:443)");
+    cmd.addOption("--redfish-user", "NAME",
+                  "Redfish user (password: SUTRA_REDFISH_PASSWORD)");
+    cmd.addOption("--redfish-ca", "FILE",
+                  "CA certificate (PEM) to trust for an https Redfish service");
     cmd.addOption("--bus,-b", "session|system|none",
-                  "D-Bus to read from (default system)");
+                  "also read D-Bus fields from this bus (default none)");
     cmd.addFlag("--tls,-t", "serve HTTPS");
     cmd.addOption("--cert,-c", "FILE", "TLS certificate (PEM)");
     cmd.addOption("--key,-k", "FILE", "TLS private key (PEM)");
@@ -77,6 +94,9 @@ std::expected<Options, std::string> readOptions(const CommandLine& cmd)
     options.tls = cmd.isSet("--tls");
     options.certPath = cmd.valueOr("--cert", "");
     options.keyPath = cmd.valueOr("--key", "");
+    options.redfishUrl = cmd.valueOr("--redfish", options.redfishUrl);
+    options.redfishUser = cmd.valueOr("--redfish-user", "");
+    options.redfishCa = cmd.valueOr("--redfish-ca", "");
 
     auto port = cmd.number<uint16_t>("--port");
     if (!port)
@@ -109,6 +129,64 @@ std::optional<std::string> readFile(const std::string& path)
     std::ostringstream text;
     text << file.rdbuf();
     return text.str();
+}
+
+/** @brief Registers the Redfish source for `options.redfishUrl`. */
+std::expected<void, std::string> addRedfishSource(
+    net::io_context& ioc, const Options& options,
+    graphql::SourceRegistry& registry)
+{
+    graphql::RedfishCredentials credentials;
+    if (const char* token = std::getenv("SUTRA_REDFISH_TOKEN"))
+    {
+        credentials.token = token;
+    }
+    if (const char* password = std::getenv("SUTRA_REDFISH_PASSWORD"))
+    {
+        credentials.password = password;
+    }
+    credentials.username = options.redfishUser;
+
+    try
+    {
+        std::shared_ptr<graphql::RedfishBackend> backend;
+        if (parseUrl(options.redfishUrl).tls)
+        {
+            std::string trusted;
+            if (!options.redfishCa.empty())
+            {
+                auto pem = readFile(options.redfishCa);
+                if (!pem)
+                {
+                    return std::unexpected("cannot read --redfish-ca file");
+                }
+                trusted = std::move(*pem);
+            }
+            auto context =
+                std::make_shared<ssl::context>(makeClientContext(trusted));
+            auto pool = HttpsConnectionPool::create(ioc.get_executor(),
+                                                    context.get(), {}, context);
+            backend = std::make_shared<graphql::RedfishHttpsBackend>(
+                pool, options.redfishUrl, credentials);
+        }
+        else
+        {
+            if (!credentials.token.empty() || !credentials.password.empty())
+            {
+                logWarning("sending Redfish credentials over plain http");
+            }
+            auto pool = HttpConnectionPool::create(ioc.get_executor());
+            backend = std::make_shared<graphql::RedfishHttpBackend>(
+                pool, options.redfishUrl, credentials);
+        }
+        registry.add(graphql::redfishSourceName,
+                     std::make_shared<graphql::RedfishSource>(backend));
+    }
+    catch (const std::exception& e)
+    {
+        return std::unexpected(std::string("--redfish: ") + e.what());
+    }
+    return {};
 }
 
 } // namespace
@@ -145,7 +223,11 @@ int main(int argc, char** argv)
 
     net::io_context ioc;
     auto registry = std::make_shared<graphql::SourceRegistry>();
-    registry->add(graphql::defaultSourceName, example::makeSampleSource());
+    if (auto added = addRedfishSource(ioc, options, *registry); !added)
+    {
+        logError("{}", added.error());
+        return 1;
+    }
 
 #ifdef SUTRA_HAVE_DBUS
     std::shared_ptr<sdbusplus::asio::connection> bus;
@@ -169,7 +251,7 @@ int main(int argc, char** argv)
     }
 #endif
 
-    // Fields whose source is not registered (no D-Bus support or no bus) are
+    // Fields whose source is not registered (no D-Bus support or no --bus) are
     // dropped; a misconfigured source stays a hard error.
     std::vector<std::string> warnings;
     if (auto applied =

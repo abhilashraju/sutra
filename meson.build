@@ -17,9 +17,10 @@ cxx = meson.get_compiler('cpp')
 # ---------------------------------------------------------------------------
 # stdexec: must be installed with -DSTDEXEC_ENABLE_ASIO=ON (boost flavour) so
 # that <exec/asio/asio_config.hpp> exists. Point the build at the install
-# prefix with CMAKE_PREFIX_PATH (see scripts/build.sh).
+# prefix with CMAKE_PREFIX_PATH (see scripts/build.sh) or PKG_CONFIG_PATH.
 # ---------------------------------------------------------------------------
-stdexec_dep = dependency('stdexec', method: 'cmake', required: true)
+# Found through pkg-config (Yocto recipe) or, failing that, CMake.
+stdexec_dep = dependency('stdexec', required: true)
 if not cxx.has_header(
     'exec/asio/asio_config.hpp',
     dependencies: stdexec_dep,

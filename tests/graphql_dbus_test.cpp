@@ -145,6 +145,31 @@ json run(Executor& executor, std::string query)
     return out;
 }
 
+/** FakeBackend whose GetAll takes time; records how many overlap. */
+class SlowBackend : public FakeBackend
+{
+  public:
+    explicit SlowBackend(net::io_context& context) : ioc(context) {}
+
+    Task<Result<DbusPropertyMap>> getAll(std::string service, std::string path,
+                                         std::string interface) override
+    {
+        ++running;
+        peak = std::max(peak, running);
+        net::steady_timer timer(ioc, 50ms);
+        co_await timer.async_wait(useSender);
+        --running;
+        co_return co_await FakeBackend::getAll(
+            std::move(service), std::move(path), std::move(interface));
+    }
+
+    int running = 0;
+    int peak = 0;
+
+  private:
+    net::io_context& ioc;
+};
+
 } // namespace
 
 TEST(GraphqlDbus, ListFromDbus)
@@ -171,6 +196,38 @@ TEST(GraphqlDbus, ListFromDbus)
     EXPECT_EQ(list[1]["Id"], "temperature_cpu");
     EXPECT_EQ(list[1]["Unit"], "Cel");
     EXPECT_EQ(list[1]["Status"]["Health"], "OK");
+}
+
+TEST(GraphqlDbus, GetAllCallsOverlap)
+{
+    net::io_context ioc;
+    auto backend = std::make_shared<SlowBackend>(ioc);
+    auto registry = std::make_shared<SourceRegistry>();
+    registry->add(dbusSourceName, std::make_shared<DbusSource>(backend));
+    Executor executor(makeSchema(), registry);
+
+    json out;
+    exec::async_scope scope;
+    auto body = [&]() -> Task<void> {
+        out = co_await executor.execute("{ sensors { Id Reading Status { "
+                                        "Health } } }");
+    };
+    spawnTask(scope, body(), "overlapping GetAll");
+    auto begin = std::chrono::steady_clock::now();
+    ioc.run();
+    auto took = std::chrono::steady_clock::now() - begin;
+
+    ASSERT_TRUE(out.contains("data")) << out.dump();
+    const auto& list = out["data"]["sensors"];
+    ASSERT_EQ(list.size(), 2u);
+    // Mapper order is preserved even though the reads overlap.
+    EXPECT_EQ(list[0]["Id"], "fantach_fan_1");
+    EXPECT_EQ(list[1]["Id"], "temperature_cpu");
+    EXPECT_EQ(list[1]["Reading"], 41.5);
+    // 2 objects x 2 interfaces are in flight together.
+    EXPECT_EQ(backend->peak, 4);
+    // Sequentially this takes 4 x 50 ms.
+    EXPECT_LT(took, 150ms);
 }
 
 TEST(GraphqlDbus, OneObjectById)

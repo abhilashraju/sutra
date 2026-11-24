@@ -8,7 +8,7 @@ hops onto one) or on stdexec's own pools.
 
 | Layer | Header(s) |
 | --- | --- |
-| Basics | `config.hpp`, `log.hpp`, `spawn.hpp`, `wait_queue.hpp` |
+| Basics | `config.hpp`, `log.hpp`, `spawn.hpp`, `wait_queue.hpp`, `gather.hpp` |
 | TCP / TLS | `connection.hpp`, `tcp_client.hpp`, `tcp_server.hpp`, `cert_generator.hpp` |
 | HTTP | `http_target.hpp`, `http_router.hpp`, `http_server.hpp`, `http_client.hpp` |
 | Pooling and retries | `connection_pool.hpp`, `web_client.hpp` |
@@ -82,6 +82,19 @@ auto [ec] = co_await timer.async_wait(useSenderNoThrow);  // error as value
 `WaitQueue` is a condition-variable-like primitive:
 `bool woken = co_await queue.wait(timeout);` with `notifyOne()` /
 `notifyAll()`.
+
+`gather()` runs a runtime-sized vector of tasks concurrently (`ex::when_all`
+has a fixed arity), bounded by `maxConcurrent` (default 8):
+
+```cpp
+std::vector<Task<int>> tasks = ...;
+std::vector<int> results = co_await gather(std::move(tasks), 4);
+```
+
+Results keep input order. If a task fails, its siblings still run to
+completion and the first failure in input order is rethrown. A stop request is
+forwarded to the children and the gather completes as stopped. Everything stays
+on the calling io_context thread, so no locking is needed.
 
 ### TCP and TLS
 
@@ -249,9 +262,11 @@ ObjectMapper) reproduce the sessions used to test it.
 * GraphQL: queries only (no mutations or subscriptions), no introspection, no
   `@skip/@include` evaluation, no `__typename`. The Redfish provider
   (`redfishPath`, `expandMembers`, `collectionLink`) and the D-Bus
-  signal-watcher subscriptions of the coroserver example were not ported;
-  root fields resolve sequentially and `DbusSource` reads objects
-  sequentially (no `when_all` batching).
+  signal-watcher subscriptions of the coroserver example were not ported.
+* Root fields, the objects of a D-Bus query and the interfaces of each object
+  are resolved concurrently through `gather()` (at most 8 in flight per level;
+  `Executor::setMaxConcurrentFields()` changes the root-field limit). Results
+  keep query / mapper order.
 * `WebClient` has no Redfish token-refresh helper.
 * TLS peer verification cannot be disabled by design.
 * `Connection` cannot interrupt a D-Bus call; Beast `tcp_stream` timers are

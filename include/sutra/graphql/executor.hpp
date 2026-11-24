@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sutra/config.hpp"
+#include "sutra/gather.hpp"
 #include "sutra/graphql/data_source.hpp"
 #include "sutra/graphql/error.hpp"
 #include "sutra/graphql/parser.hpp"
@@ -69,16 +70,25 @@ class Executor
             }
         }
 
-        nlohmann::json data = nlohmann::json::object();
+        // Query root fields are independent, so resolve them concurrently
+        // (bounded). Results keep the query order; the first failing field in
+        // that order decides the error, exactly as in sequential execution.
+        std::vector<Task<Result<nlohmann::json>>> pending;
+        pending.reserve(operation.selections.size());
         for (const FieldSelection& selection : operation.selections)
         {
-            Result<nlohmann::json> field =
-                co_await resolveRootField(selection, merged);
-            if (!field)
+            pending.push_back(resolveRootField(selection, merged));
+        }
+        auto fields = co_await gather(std::move(pending), maxConcurrentFields);
+
+        nlohmann::json data = nlohmann::json::object();
+        for (size_t i = 0; i < fields.size(); ++i)
+        {
+            if (!fields[i])
             {
-                co_return errorResponse(field.error());
+                co_return errorResponse(fields[i].error());
             }
-            data[outputName(selection)] = std::move(*field);
+            data[outputName(operation.selections[i])] = std::move(*fields[i]);
         }
         co_return nlohmann::json{{"data", std::move(data)}};
     }
@@ -86,6 +96,12 @@ class Executor
     const Schema& getSchema() const
     {
         return schema;
+    }
+
+    /** @brief Root fields resolved at the same time (default 8). */
+    void setMaxConcurrentFields(size_t value)
+    {
+        maxConcurrentFields = value;
     }
 
   private:
@@ -266,6 +282,7 @@ class Executor
 
     Schema schema;
     std::shared_ptr<const SourceRegistry> sources;
+    size_t maxConcurrentFields = 8;
 };
 
 } // namespace sutra::graphql

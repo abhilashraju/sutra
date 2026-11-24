@@ -200,3 +200,103 @@ TEST(GraphqlExecutor, ThrowingSourceBecomesError)
     json r = run(executor, "{ version }");
     EXPECT_NE(firstError(r).find("boom"), std::string::npos);
 }
+
+namespace
+{
+
+/** Sleeps in every fetch and records how many fetches overlap. */
+class SlowSource : public DataSource
+{
+  public:
+    SlowSource(net::io_context& context, std::chrono::milliseconds firstDelay,
+               std::chrono::milliseconds step) :
+        ioc(context), first(firstDelay), decrement(step)
+    {}
+
+    Result<void> validate(const FieldSpec&) const override
+    {
+        return {};
+    }
+
+    Task<Result<json>> fetch(const FieldSpec&, const json&) override
+    {
+        const int index = started++;
+        ++running;
+        peak = std::max(peak, running);
+        net::steady_timer timer(ioc, first - index * decrement);
+        co_await timer.async_wait(useSender);
+        --running;
+        co_return json("v" + std::to_string(index));
+    }
+
+    int started = 0;
+    int running = 0;
+    int peak = 0;
+
+  private:
+    net::io_context& ioc;
+    std::chrono::milliseconds first;
+    std::chrono::milliseconds decrement;
+};
+
+} // namespace
+
+TEST(GraphqlExecutor, RootFieldsResolveConcurrentlyInQueryOrder)
+{
+    net::io_context ioc;
+    // The first field is the slowest, the last the fastest.
+    auto slow = std::make_shared<SlowSource>(ioc, 100ms, 20ms);
+    auto schema = Schema::fromJson(graphql_fixture::schemaJson());
+    ASSERT_TRUE(schema);
+    auto registry = std::make_shared<SourceRegistry>();
+    registry->add("memory", slow);
+    std::vector<std::string> warnings;
+    ASSERT_TRUE(applySourceRegistry(*schema, *registry, true, warnings));
+    Executor executor(std::move(*schema), registry);
+
+    json out;
+    exec::async_scope scope;
+    auto body = [&]() -> Task<void> {
+        out = co_await executor.execute("{ a: version b: version c: version "
+                                        "d: version e: version }");
+    };
+    spawnTask(scope, body(), "concurrent root fields");
+    auto begin = std::chrono::steady_clock::now();
+    ioc.run();
+    auto took = std::chrono::steady_clock::now() - begin;
+
+    ASSERT_TRUE(out.contains("data")) << out.dump();
+    // Values follow the selection order, not the completion order.
+    EXPECT_EQ(out["data"]["a"], "v0");
+    EXPECT_EQ(out["data"]["b"], "v1");
+    EXPECT_EQ(out["data"]["e"], "v4");
+    EXPECT_EQ(slow->peak, 5);
+    // Sequentially: 100+80+60+40+20 = 300 ms.
+    EXPECT_LT(took, 200ms);
+}
+
+TEST(GraphqlExecutor, RootFieldConcurrencyIsBounded)
+{
+    net::io_context ioc;
+    auto slow = std::make_shared<SlowSource>(ioc, 10ms, 0ms);
+    auto schema = Schema::fromJson(graphql_fixture::schemaJson());
+    ASSERT_TRUE(schema);
+    auto registry = std::make_shared<SourceRegistry>();
+    registry->add("memory", slow);
+    std::vector<std::string> warnings;
+    ASSERT_TRUE(applySourceRegistry(*schema, *registry, true, warnings));
+    Executor executor(std::move(*schema), registry);
+    executor.setMaxConcurrentFields(2);
+
+    json out;
+    exec::async_scope scope;
+    auto body = [&]() -> Task<void> {
+        out = co_await executor.execute("{ a: version b: version c: version "
+                                        "d: version e: version }");
+    };
+    spawnTask(scope, body(), "bounded root fields");
+    ioc.run();
+    ASSERT_TRUE(out.contains("data")) << out.dump();
+    EXPECT_EQ(slow->started, 5);
+    EXPECT_EQ(slow->peak, 2);
+}

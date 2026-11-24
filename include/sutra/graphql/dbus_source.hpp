@@ -26,6 +26,7 @@
  */
 
 #include "sutra/dbus.hpp"
+#include "sutra/gather.hpp"
 #include "sutra/graphql/data_source.hpp"
 #include "sutra/log.hpp"
 
@@ -476,24 +477,50 @@ inline std::optional<nlohmann::json> idFromPath(const DbusSourceConfig& config,
     return std::nullopt;
 }
 
-// Fetch the needed interfaces of one object and map them to response JSON.
+// Upper bound for D-Bus calls in flight per object and per query field.
+inline constexpr size_t maxConcurrentReads = 8;
+
+// Reads one interface of one object. A failure is logged and yields nullopt so
+// the other interfaces of the object are still used.
+inline Task<std::optional<DbusPropertyMap>> readInterface(
+    std::shared_ptr<DbusBackend> backend, std::string service, std::string path,
+    std::string interface)
+{
+    Result<DbusPropertyMap> props =
+        co_await backend->getAll(service, path, interface);
+    if (!props)
+    {
+        logWarning("GetAll {} {} on {} failed: {}", path, interface, service,
+                   props.error());
+        co_return std::nullopt;
+    }
+    co_return std::move(*props);
+}
+
+// Fetch the needed interfaces of one object (concurrently) and map them to
+// response JSON.
 inline Task<nlohmann::json> buildObject(
     std::shared_ptr<DbusBackend> backend,
     std::shared_ptr<const DbusSourceConfig> config, std::string path,
     std::map<std::string, std::string> serviceByInterface)
 {
-    std::map<std::string, DbusPropertyMap> propertiesByInterface;
+    std::vector<std::string> interfaceNames;
+    std::vector<Task<std::optional<DbusPropertyMap>>> reads;
     for (const auto& [interface, service] : serviceByInterface)
     {
-        Result<DbusPropertyMap> props =
-            co_await backend->getAll(service, path, interface);
-        if (!props)
+        interfaceNames.push_back(interface);
+        reads.push_back(readInterface(backend, service, path, interface));
+    }
+    auto fetched = co_await gather(std::move(reads), maxConcurrentReads);
+
+    std::map<std::string, DbusPropertyMap> propertiesByInterface;
+    for (size_t i = 0; i < fetched.size(); ++i)
+    {
+        if (fetched[i])
         {
-            logWarning("GetAll {} {} on {} failed: {}", path, interface,
-                       service, props.error());
-            continue;
+            propertiesByInterface.emplace(interfaceNames[i],
+                                          std::move(*fetched[i]));
         }
-        propertiesByInterface.emplace(interface, std::move(*props));
     }
 
     nlohmann::json object = nlohmann::json::object();
@@ -525,7 +552,8 @@ inline Task<nlohmann::json> buildObject(
 /**
  * @brief DataSource that fills a root field from D-Bus.
  *
- * Objects are read one after the other (GetAll per object and interface).
+ * Objects, and the interfaces of each object, are read concurrently (bounded
+ * by dbus_source_detail::maxConcurrentReads per level).
  */
 class DbusSource : public DataSource
 {
@@ -618,7 +646,8 @@ class DbusSource : public DataSource
             wantedId = args[config->idArg];
         }
 
-        nlohmann::json members = nlohmann::json::array();
+        // Build every object concurrently (bounded); keep the mapper's order.
+        std::vector<Task<nlohmann::json>> builds;
         for (const auto& [path, services] : *primary)
         {
             if (wantedId)
@@ -641,8 +670,15 @@ class DbusSource : public DataSource
                     }
                 }
             }
-            nlohmann::json object = co_await dbus_source_detail::buildObject(
-                backend, config, path, std::move(serviceByInterface));
+            builds.push_back(dbus_source_detail::buildObject(
+                backend, config, path, std::move(serviceByInterface)));
+        }
+        auto objects = co_await gather(std::move(builds),
+                                       dbus_source_detail::maxConcurrentReads);
+
+        nlohmann::json members = nlohmann::json::array();
+        for (auto& object : objects)
+        {
             if (wantedId &&
                 object.value(config->idKey, nlohmann::json()) != *wantedId)
             {

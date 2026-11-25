@@ -1,6 +1,6 @@
 #include "graphql_fixture.hpp"
-#include "sutra/graphql/dbus_property_watcher.hpp"
 #include "sutra/graphql/executor.hpp"
+#include "sutra/graphql/ql_dbus_property_watcher.hpp"
 #include "sutra/spawn.hpp"
 
 #include <gtest/gtest.h>
@@ -11,7 +11,7 @@ using nlohmann::json;
 
 TEST(GraphqlSubscription, DbusWatcherIndexResolution)
 {
-    std::vector<DbusWatcher> watchers = {
+    std::vector<graphql::DbusWatcher> watchers = {
         {"/xyz/openbmc_project/state/host0",
          "xyz.openbmc_project.State.Host",
          "CurrentHostState",

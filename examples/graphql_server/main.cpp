@@ -30,8 +30,8 @@
 #include "sutra/http_server.hpp"
 
 #ifdef SUTRA_HAVE_DBUS
-#include "sutra/graphql/dbus_property_watcher.hpp"
 #include "sutra/graphql/dbus_source.hpp"
+#include "sutra/graphql/ql_dbus_property_watcher.hpp"
 #endif
 
 #include <chrono>
@@ -511,10 +511,10 @@ int run(const Options& options)
     }
 
 #ifdef SUTRA_HAVE_DBUS
-    std::shared_ptr<graphql::GraphQLDbusPropertyWatcher> watcher;
+    std::shared_ptr<graphql::QLDbusPropertyWatcher> watcher;
     if (dbusConn)
     {
-        watcher = std::make_shared<graphql::GraphQLDbusPropertyWatcher>(
+        watcher = std::make_shared<graphql::QLDbusPropertyWatcher>(
             dbusConn, (*executor)->getDbusWatchers(),
             [exec = *executor](const std::unordered_set<std::string>& fields) {
                 exec->notifyFieldsChanged(fields);

@@ -2,11 +2,13 @@
 
 #ifdef SUTRA_HAVE_DBUS
 
+#include "sutra/config.hpp"
 #include "sutra/dbus.hpp"
+#include "sutra/dbus_property_watcher.hpp"
 #include "sutra/graphql/schema.hpp"
+#include "sutra/spawn.hpp"
 
 #include <sdbusplus/asio/connection.hpp>
-#include <sdbusplus/bus/match.hpp>
 
 #include <functional>
 #include <memory>
@@ -25,7 +27,7 @@ using DbusWatcherIndex =
 
 // Build the reverse index from the DbusWatcher table in the schema.
 inline DbusWatcherIndex buildDbusWatcherIndex(
-    const std::vector<DbusWatcher>& watchers)
+    const std::vector<graphql::DbusWatcher>& watchers)
 {
     DbusWatcherIndex idx;
     for (const auto& w : watchers)
@@ -69,22 +71,22 @@ inline std::vector<std::string> resolveFields(
     return fields;
 }
 
-// GraphQLDbusPropertyWatcher: registers a single bus-wide PropertiesChanged
+// QLDbusPropertyWatcher: registers a single bus-wide PropertiesChanged
 // match rule and filters every signal through the DbusWatcherIndex.
 //
 // Any signal whose (object, interface, property) triple resolves to one or
 // more GraphQL fields triggers a single notifyFn_ call with the deduplicated
 // set of affected fields. Signals that resolve to nothing are discarded with
 // a single O(1) index miss - no per-object or per-interface rules needed.
-class GraphQLDbusPropertyWatcher
+class QLDbusPropertyWatcher
 {
   public:
     using NotifyFn = std::function<void(
         const std::unordered_set<std::string>& graphqlFields)>;
 
-    GraphQLDbusPropertyWatcher(
-        std::shared_ptr<sdbusplus::asio::connection> conn,
-        const std::vector<DbusWatcher>& watchers, NotifyFn notifyFn) :
+    QLDbusPropertyWatcher(std::shared_ptr<sdbusplus::asio::connection> conn,
+                          const std::vector<graphql::DbusWatcher>& watchers,
+                          NotifyFn notifyFn) :
         conn_(std::move(conn)), index_(buildDbusWatcherIndex(watchers)),
         notifyFn_(std::move(notifyFn))
     {
@@ -99,58 +101,80 @@ class GraphQLDbusPropertyWatcher
             sdbusplus::bus::match::rules::interface(
                 "org.freedesktop.DBus.Properties");
 
-        match_ = std::make_unique<sdbusplus::bus::match_t>(
-            *conn_, rule,
-            [this](sdbusplus::message_t& msg) { handleSignal(msg); });
+        watcher_ = DbusSignalWatcher<sdbusplus::message_t>::create(conn_, rule);
+
+        scope_.spawn(watchLoop() | ex::upon_error([](std::exception_ptr) {}) |
+                     ex::upon_stopped([]() {}));
     }
 
   private:
-    void handleSignal(sdbusplus::message_t& msg)
+    Task<void> watchLoop()
     {
-        const std::string objectPath = msg.get_path();
-
-        std::string interfaceName;
-        PropertyMap changedProperties;
-        std::vector<std::string> invalidatedProperties;
-
-        try
+        if (!watcher_)
         {
-            msg.read(interfaceName, changedProperties, invalidatedProperties);
-        }
-        catch (const std::exception&)
-        {
-            return; // malformed signal - skip
+            co_return;
         }
 
-        std::unordered_set<std::string> affectedFields;
-        for (const auto& [prop, value] : changedProperties)
-        {
-            for (const auto& field :
-                 resolveFields(index_, objectPath, interfaceName, prop))
-            {
-                affectedFields.insert(field);
-            }
-        }
-        for (const auto& prop : invalidatedProperties)
-        {
-            for (const auto& field :
-                 resolveFields(index_, objectPath, interfaceName, prop))
-            {
-                affectedFields.insert(field);
-            }
-        }
+        co_await watcher_->watch(
+            [this](const error_code& ec,
+                   std::optional<sdbusplus::message_t> maybeMsg) -> Task<bool> {
+                if (ec || !maybeMsg)
+                {
+                    co_return false;
+                }
 
-        if (!affectedFields.empty() && notifyFn_)
-        {
-            notifyFn_(affectedFields);
-        }
+                sdbusplus::message_t msg = std::move(*maybeMsg);
+                const std::string objectPath = msg.get_path();
+
+                std::string interfaceName;
+                PropertyMap changedProperties;
+                std::vector<std::string> invalidatedProperties;
+
+                try
+                {
+                    msg.read(interfaceName, changedProperties,
+                             invalidatedProperties);
+                }
+                catch (const std::exception&)
+                {
+                    co_return true; // malformed signal - skip
+                }
+
+                std::unordered_set<std::string> affectedFields;
+                for (const auto& [prop, value] : changedProperties)
+                {
+                    for (const auto& field :
+                         resolveFields(index_, objectPath, interfaceName, prop))
+                    {
+                        affectedFields.insert(field);
+                    }
+                }
+                for (const auto& prop : invalidatedProperties)
+                {
+                    for (const auto& field :
+                         resolveFields(index_, objectPath, interfaceName, prop))
+                    {
+                        affectedFields.insert(field);
+                    }
+                }
+
+                if (!affectedFields.empty() && notifyFn_)
+                {
+                    notifyFn_(affectedFields);
+                }
+
+                co_return true;
+            });
     }
 
     std::shared_ptr<sdbusplus::asio::connection> conn_;
     DbusWatcherIndex index_;
     NotifyFn notifyFn_;
-    std::unique_ptr<sdbusplus::bus::match_t> match_;
+    std::shared_ptr<DbusSignalWatcher<sdbusplus::message_t>> watcher_;
+    exec::async_scope scope_;
 };
+
+using GraphQLDbusPropertyWatcher = QLDbusPropertyWatcher;
 
 } // namespace sutra::graphql
 

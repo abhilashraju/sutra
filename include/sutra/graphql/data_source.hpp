@@ -80,33 +80,42 @@ inline Result<void> applySourceRegistry(
     Schema& schema, const SourceRegistry& registry, bool strict,
     std::vector<std::string>& warnings)
 {
-    auto& fields = schema.mutableRootQueries();
-    std::vector<std::string> toDrop;
-    for (const auto& [name, fieldSpec] : fields)
-    {
-        if (!registry.has(fieldSpec.source))
+    auto process = [&](auto& fieldMap, const char* kind) -> Result<void> {
+        std::vector<std::string> toDrop;
+        for (const auto& [name, fieldSpec] : fieldMap)
         {
-            std::string message =
-                "query field '" + name + "' uses unavailable source '" +
-                fieldSpec.source + "'";
-            if (strict)
+            if (!registry.has(fieldSpec.source))
             {
-                return std::unexpected(message);
+                std::string message =
+                    std::string(kind) + " field '" + name +
+                    "' uses unavailable source '" + fieldSpec.source + "'";
+                if (strict)
+                {
+                    return std::unexpected(message);
+                }
+                warnings.push_back(message + "; field dropped");
+                toDrop.push_back(name);
+                continue;
             }
-            warnings.push_back(message + "; field dropped");
-            toDrop.push_back(name);
-            continue;
+            if (auto r = registry.get(fieldSpec.source)->validate(fieldSpec);
+                !r)
+            {
+                return std::unexpected(
+                    std::string(kind) + " field '" + name + "': " + r.error());
+            }
         }
-        if (auto r = registry.get(fieldSpec.source)->validate(fieldSpec); !r)
+        for (const auto& name : toDrop)
         {
-            return std::unexpected("query field '" + name + "': " + r.error());
+            fieldMap.erase(name);
         }
-    }
-    for (const auto& name : toDrop)
+        return {};
+    };
+
+    if (auto r = process(schema.mutableRootQueries(), "query"); !r)
     {
-        fields.erase(name);
+        return r;
     }
-    return {};
+    return process(schema.mutableRootSubscriptions(), "subscription");
 }
 
 /**

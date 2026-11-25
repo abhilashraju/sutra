@@ -24,6 +24,8 @@ inherit meson pkgconfig systemd
 
 EXTRA_OEMESON += " \
     --buildtype=minsize \
+    -Db_lto=true \
+    -Db_ndebug=true \
     -Dexamples=enabled \
     -Dinstall_example=true \
 "

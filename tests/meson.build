@@ -18,6 +18,7 @@ sutra_tests = {
     'graphql_endpoint_test': ['graphql_endpoint_test.cpp'],
     'graphql_dbus_test': ['graphql_dbus_test.cpp'],
     'graphql_redfish_test': ['graphql_redfish_test.cpp'],
+    'graphql_subscription_test': ['graphql_subscription_test.cpp'],
 }
 
 foreach name, srcs : sutra_tests

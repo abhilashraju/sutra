@@ -263,8 +263,7 @@ graphql_server --redfish https://bmc:443 --redfish-ca /etc/ssl/certs/authority \
                                                  # directory as shown)
 graphql_server --redfish http://127.0.0.1:9000   # plain-http Redfish
 graphql_server --bus system                      # + live D-Bus sensors
-graphql_server --port 8443                       # HTTPS, self-signed cert on stdout
-graphql_server --cert c.pem --key k.pem          # your own certificate
+graphql_server --cert c.pem --key k.pem          # HTTPS (cert and key required)
 graphql_server --no-tls                          # plain HTTP
 curl -s --cacert cert.pem https://localhost:8080/graphql \
      -H 'Content-Type: application/json' \

@@ -128,5 +128,74 @@
           "Status/Health":   { "interface": "xyz.openbmc_project.State.Decorator.OperationalStatus", "property": "Functional", "transform": "functionalToHealth" }
         }
       } }
+  ],
+
+  "subscriptions": [
+    { "name": "systemStatus", "returnType": "ComputerSystem", "source": "redfish",
+      "arguments": [{ "name": "id", "typeName": "ID", "required": true }],
+      "sourceConfig": { "path": "/redfish/v1/Systems/{id}" } },
+    { "name": "chassisStatus", "returnType": "Chassis", "source": "redfish",
+      "arguments": [{ "name": "id", "typeName": "ID", "required": true }],
+      "sourceConfig": { "path": "/redfish/v1/Chassis/{id}" } },
+    { "name": "chassisUpdates", "returnType": "Chassis", "isList": true, "source": "redfish",
+      "sourceConfig": { "path": "/redfish/v1/Chassis" } },
+    { "name": "ethernetInterfaceUpdates", "returnType": "EthernetInterface", "isList": true, "source": "redfish",
+      "arguments": [{ "name": "managerId", "typeName": "ID", "default": "bmc" }],
+      "sourceConfig": { "path": "/redfish/v1/Managers/{managerId}/EthernetInterfaces" } },
+    { "name": "sensorUpdates", "returnType": "Sensor", "isList": true, "source": "redfish",
+      "arguments": [{ "name": "chassisId", "typeName": "ID", "default": "chassis" }],
+      "sourceConfig": { "path": "/redfish/v1/Chassis/{chassisId}/Sensors", "expandMembers": true } },
+    { "name": "dbusSensorUpdates", "returnType": "Sensor", "isList": true, "source": "dbus",
+      "sourceConfig": {
+        "subtree": "/xyz/openbmc_project/sensors",
+        "interfaces": ["xyz.openbmc_project.Sensor.Value"],
+        "fields": {
+          "Id":              { "from": "path", "transform": "sensorId" },
+          "Name":            { "from": "path", "transform": "sensorName" },
+          "Reading":         { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Value" },
+          "ReadingUnits":    { "interface": "xyz.openbmc_project.Sensor.Value", "property": "Unit", "transform": "sensorUnit" },
+          "ReadingRangeMax": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MaxValue" },
+          "ReadingRangeMin": { "interface": "xyz.openbmc_project.Sensor.Value", "property": "MinValue" }
+        }
+      } }
+  ],
+
+  "dbusWatchers": [
+    {
+      "dbusObject":    "/xyz/openbmc_project/state/host0",
+      "dbusInterface": "xyz.openbmc_project.State.Host",
+      "dbusProperty":  "CurrentHostState",
+      "graphqlFields": ["systemStatus"]
+    },
+    {
+      "dbusObject":    "/xyz/openbmc_project/state/chassis0",
+      "dbusInterface": "xyz.openbmc_project.State.Chassis",
+      "dbusProperty":  "CurrentPowerState",
+      "graphqlFields": ["chassisStatus", "chassisUpdates"]
+    },
+    {
+      "dbusObject":    "",
+      "dbusInterface": "xyz.openbmc_project.Network.EthernetInterface",
+      "dbusProperty":  "",
+      "graphqlFields": ["ethernetInterfaceUpdates"]
+    },
+    {
+      "dbusObject":    "",
+      "dbusInterface": "xyz.openbmc_project.Sensor.Value",
+      "dbusProperty":  "Value",
+      "graphqlFields": ["sensorUpdates", "dbusSensorUpdates"]
+    },
+    {
+      "dbusObject":    "",
+      "dbusInterface": "xyz.openbmc_project.Sensor.Threshold.Warning",
+      "dbusProperty":  "",
+      "graphqlFields": ["sensorUpdates"]
+    },
+    {
+      "dbusObject":    "",
+      "dbusInterface": "xyz.openbmc_project.Sensor.Threshold.Critical",
+      "dbusProperty":  "",
+      "graphqlFields": ["sensorUpdates"]
+    }
   ]
 }

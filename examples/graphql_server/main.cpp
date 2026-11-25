@@ -16,9 +16,8 @@
  * line: SUTRA_REDFISH_TOKEN (X-Auth-Token) or SUTRA_REDFISH_PASSWORD (with
  * --redfish-user, HTTP Basic).
  *
- * The server speaks HTTPS unless --no-tls is given. Without --cert/--key a
- * throw-away self-signed certificate is generated at start-up (printed to
- * stdout so clients can pin it with `curl --cacert`). An https Redfish
+ * The server speaks HTTPS unless --no-tls is given; HTTPS requires --cert and
+ * --key (no certificate is generated). An https Redfish
  * service is verified against the CA directory --redfish-ca (default
  * /etc/ssl/certs/authority), and its certificate must carry the host in the
  * URL, or --redfish-server-name when the certificate names a different host
@@ -31,6 +30,7 @@
 #include "sutra/http_server.hpp"
 
 #ifdef SUTRA_HAVE_DBUS
+#include "sutra/graphql/dbus_property_watcher.hpp"
 #include "sutra/graphql/dbus_source.hpp"
 #endif
 
@@ -95,8 +95,10 @@ CommandLine makeCommandLine()
     cmd.addOption("--bus,-b", "session|system|none",
                   "also read D-Bus fields from this bus (default none)");
     cmd.addFlag("--no-tls", "serve plain HTTP instead of HTTPS");
-    cmd.addOption("--cert,-c", "FILE", "TLS certificate (PEM)");
-    cmd.addOption("--key,-k", "FILE", "TLS private key (PEM)");
+    cmd.addOption("--cert,-c", "FILE",
+                  "TLS certificate (PEM), required for HTTPS");
+    cmd.addOption("--key,-k", "FILE",
+                  "TLS private key (PEM), required for HTTPS");
     cmd.addFlag("--help,-h", "show this help");
     return cmd;
 }
@@ -113,6 +115,10 @@ std::optional<std::string> validateOptions(const Options& options)
     if (options.certPath.empty() != options.keyPath.empty())
     {
         return "--cert and --key must be given together";
+    }
+    if (options.tls && options.certPath.empty())
+    {
+        return "HTTPS needs --cert and --key (or use --no-tls)";
     }
     if (!options.tls && !options.certPath.empty())
     {
@@ -268,14 +274,14 @@ std::expected<void, std::string> addRedfishSource(
  * A no-op without D-Bus support or with `--bus none`. The source owns the bus
  * connection, so nothing needs to be kept by the caller.
  */
-void addDbusSource([[maybe_unused]] net::io_context& ioc,
-                   [[maybe_unused]] const Options& options,
-                   [[maybe_unused]] graphql::SourceRegistry& registry)
-{
 #ifdef SUTRA_HAVE_DBUS
+std::shared_ptr<sdbusplus::asio::connection> addDbusSource(
+    net::io_context& ioc, const Options& options,
+    graphql::SourceRegistry& registry)
+{
     if (options.bus == "none")
     {
-        return;
+        return nullptr;
     }
     try
     {
@@ -285,14 +291,23 @@ void addDbusSource([[maybe_unused]] net::io_context& ioc,
         registry.add(graphql::dbusSourceName,
                      std::make_shared<graphql::DbusSource>(
                          std::make_shared<graphql::SutraDbusBackend>(bus)));
+        return bus;
     }
     catch (const std::exception& e)
     {
         logWarning("D-Bus unavailable ({}); dbus fields are disabled",
                    e.what());
     }
-#endif
+    return nullptr;
 }
+#else
+std::nullptr_t addDbusSource([[maybe_unused]] net::io_context& ioc,
+                             [[maybe_unused]] const Options& options,
+                             [[maybe_unused]] graphql::SourceRegistry& registry)
+{
+    return nullptr;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // GraphQL executor and HTTP routes
@@ -305,7 +320,8 @@ void addDbusSource([[maybe_unused]] net::io_context& ioc,
  * dropped with a warning; a misconfigured source stays a hard error.
  */
 std::expected<std::shared_ptr<graphql::Executor>, std::string> makeExecutor(
-    graphql::Schema schema, std::shared_ptr<graphql::SourceRegistry> registry)
+    graphql::Schema schema, std::shared_ptr<graphql::SourceRegistry> registry,
+    net::any_io_executor ioExec)
 {
     std::vector<std::string> warnings;
     if (auto applied =
@@ -318,8 +334,8 @@ std::expected<std::shared_ptr<graphql::Executor>, std::string> makeExecutor(
     {
         logWarning("{}", warning);
     }
-    return std::make_shared<graphql::Executor>(std::move(schema),
-                                               std::move(registry));
+    return std::make_shared<graphql::Executor>(
+        std::move(schema), std::move(registry), std::move(ioExec));
 }
 
 void addRoutes(HttpRouter& router,
@@ -329,21 +345,37 @@ void addRoutes(HttpRouter& router,
     router.get("/health", [](HttpRequest&, RequestContext&) {
         return jsonResponse(http::status::ok, R"({"status":"ok"})");
     });
+    router.get("/schema", [](HttpRequest&, RequestContext&) {
+        nlohmann::json schemaDoc = {
+            {"queries",
+             {{"serviceRoot", "Get Redfish service root"},
+              {"systems", "List Redfish systems"},
+              {"system", "Get a Redfish system by id"},
+              {"chassis", "List Redfish chassis"},
+              {"sensors", "List sensors"},
+              {"sensor", "Get a sensor by id"}}},
+            {"subscriptions",
+             {{"systemStatus",
+               "Stream live updates for a ComputerSystem (arg: id)"},
+              {"chassisStatus", "Stream live updates for a Chassis (arg: id)"},
+              {"sensorUpdates",
+               "Stream live updates for sensors (arg: chassisId)"}}},
+            {"events",
+             {{"POST /graphql/events",
+               "Inject an event to fire matching subscriptions immediately. "
+               "Body: {\"fields\":[\"fieldName\",...]}"}}},
+            {"triggerModes",
+             {{"event",
+               "DBus-driven or externally injected - wakes on signal (default)"},
+              {"timer",
+               "Poll on fixed interval (use &interval=N, default 5s)"}}}};
+        return jsonResponse(http::status::ok, schemaDoc.dump());
+    });
 }
 
 // ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
-
-/** @brief Generates a throw-away certificate and prints it for pinning. */
-PemPair makeSelfSignedPair()
-{
-    PemPair pair = generateSelfSignedCertificate(
-        "sutra-graphql", "DNS:localhost,IP:127.0.0.1", 1);
-    std::printf("%s", pair.certificate.c_str());
-    std::fflush(stdout);
-    return pair;
-}
 
 /** @brief Reads --cert/--key. */
 std::expected<PemPair, std::string> readPemPair(const Options& options)
@@ -364,12 +396,6 @@ std::expected<std::optional<ssl::context>, std::string> loadTlsContext(
     if (!options.tls)
     {
         return std::optional<ssl::context>();
-    }
-    if (options.certPath.empty())
-    {
-        PemPair pair = makeSelfSignedPair();
-        return std::optional<ssl::context>(
-            makeServerContext(pair.certificate, pair.privateKey));
     }
     auto pair = readPemPair(options);
     if (!pair)
@@ -474,14 +500,28 @@ int run(const Options& options)
         logError("{}", added.error());
         return 1;
     }
-    addDbusSource(ioc, options, *registry);
+    auto dbusConn = addDbusSource(ioc, options, *registry);
 
-    auto executor = makeExecutor(std::move(*schema), registry);
+    auto executor =
+        makeExecutor(std::move(*schema), registry, ioc.get_executor());
     if (!executor)
     {
         logError("{}", executor.error());
         return 1;
     }
+
+#ifdef SUTRA_HAVE_DBUS
+    std::shared_ptr<graphql::GraphQLDbusPropertyWatcher> watcher;
+    if (dbusConn)
+    {
+        watcher = std::make_shared<graphql::GraphQLDbusPropertyWatcher>(
+            dbusConn, (*executor)->getDbusWatchers(),
+            [exec = *executor](const std::unordered_set<std::string>& fields) {
+                exec->notifyFieldsChanged(fields);
+            });
+    }
+#endif
+
     HttpRouter router;
     addRoutes(router, *executor);
 

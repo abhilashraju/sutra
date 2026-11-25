@@ -88,6 +88,20 @@ class Connection
     }
 
     /**
+     * @brief Like write(), but reports failure as a value instead of throwing.
+     * @return the failure (a timeout is `timed_out`), or a default error_code
+     *         on success. Cancellation still completes the task as stopped.
+     */
+    Task<error_code> tryWrite(std::string_view data)
+    {
+        arm(timeout);
+        auto [ec, count] = co_await net::async_write(
+            stream_, net::buffer(data.data(), data.size()), useSenderNoThrow);
+        static_cast<void>(count);
+        co_return co_await checkOp(ec);
+    }
+
+    /**
      * @brief Reads up to `maxBytes`. Returns buffered data first.
      * @return the bytes read, or an empty string at end of stream.
      */
@@ -162,6 +176,15 @@ class Connection
         co_return std::get<1>(result);
     }
 
+    /** @brief Like run(), but reports failure as a value (see tryWrite). */
+    template <class Initiate>
+    Task<error_code> tryRun(Initiate initiate)
+    {
+        arm(timeout);
+        auto result = co_await initiate(useSenderNoThrow);
+        co_return co_await checkOp(std::get<0>(result));
+    }
+
     /** @brief TLS handshake (TLS streams only), bounded by `limit`. */
     Task<void> handshake(ssl::stream_base::handshake_type type,
                          std::optional<Duration> limit)
@@ -171,6 +194,17 @@ class Connection
         arm(limit);
         auto result = co_await stream_.async_handshake(type, useSenderNoThrow);
         co_await finishOp(std::get<0>(result));
+    }
+
+    /** @brief Like handshake(), but reports failure as a value. */
+    Task<error_code> tryHandshake(ssl::stream_base::handshake_type type,
+                                  std::optional<Duration> limit)
+    {
+        static_assert(!std::is_same_v<Stream, tcp::socket>,
+                      "handshake needs a TLS stream");
+        arm(limit);
+        auto result = co_await stream_.async_handshake(type, useSenderNoThrow);
+        co_return co_await checkOp(std::get<0>(result));
     }
 
     /** @brief Shuts the socket down and closes it. Never throws. */
@@ -225,24 +259,37 @@ class Connection
         });
     }
 
-    /** @brief Turns the result of an armed operation into the Task outcome. */
-    Task<void> finishOp(error_code ec)
+    /**
+     * @brief Non-throwing form of finishOp().
+     * @return success, `timed_out` for a watchdog expiry, or the failure.
+     *         A cancellation that is not a timeout completes the task as
+     *         stopped.
+     */
+    Task<error_code> checkOp(error_code ec)
     {
         disarm();
         if (!ec)
         {
-            co_return;
+            co_return error_code();
         }
         if (ec == net::error::operation_aborted)
         {
             if (timedOut)
             {
-                throw system_error(
-                    make_error_code(boost::system::errc::timed_out));
+                co_return make_error_code(boost::system::errc::timed_out);
             }
             co_await ex::just_stopped();
         }
-        throw system_error(ec);
+        co_return ec;
+    }
+
+    /** @brief Turns the result of an armed operation into the Task outcome. */
+    Task<void> finishOp(error_code ec)
+    {
+        if (auto failure = co_await checkOp(ec))
+        {
+            throw system_error(failure);
+        }
     }
 
   private:

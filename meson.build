@@ -8,11 +8,21 @@ project(
         'cpp_std=c++23',
         'warning_level=2',
         'werror=false',
-        'buildtype=debugoptimized',
+        'buildtype=minsize',
     ],
 )
 
 cxx = meson.get_compiler('cpp')
+
+# Size: put every function/variable in its own section and let the linker drop
+# the unreferenced ones (the header-only stack leaves many unused template
+# instances behind).
+add_project_arguments('-ffunction-sections', '-fdata-sections', language: 'cpp')
+if cxx.has_link_argument('-Wl,--gc-sections')
+    add_project_link_arguments('-Wl,--gc-sections', language: 'cpp')
+elif cxx.has_link_argument('-Wl,-dead_strip')
+    add_project_link_arguments('-Wl,-dead_strip', language: 'cpp')
+endif
 
 # ---------------------------------------------------------------------------
 # stdexec: must be installed with -DSTDEXEC_ENABLE_ASIO=ON (boost flavour) so

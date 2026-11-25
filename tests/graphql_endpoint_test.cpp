@@ -23,7 +23,8 @@ void withClient(Body& body, EndpointOptions options = {})
 {
     net::io_context ioc;
     HttpRouter router;
-    registerGraphqlEndpoint(router, graphql_fixture::makeExecutor(), options);
+    auto exec = graphql_fixture::makeExecutor(ioc.get_executor());
+    registerGraphqlEndpoint(router, exec, options);
     HttpServer server(ioc.get_executor(), loopback(), router);
     server.start();
 
@@ -173,4 +174,41 @@ TEST(GraphqlEndpoint, OversizedQueryIsRejected)
     EndpointOptions options;
     options.maxQueryBytes = 100;
     withClient(body, options);
+}
+
+TEST(GraphqlEndpoint, SubscriptionStatsEndpoint)
+{
+    auto body = [](HttpClient& client) -> Task<void> {
+        HttpRequest req{http::verb::get, "/graphql/subscriptions/stats", 11};
+        auto res = co_await client.send(std::move(req));
+        EXPECT_EQ(res.result(), http::status::ok);
+        json out = json::parse(res.body());
+        EXPECT_TRUE(out.contains("active_shared_loops"));
+        EXPECT_TRUE(out.contains("total_client_subscribers"));
+        EXPECT_TRUE(out.contains("multiplexed_subscribers"));
+        EXPECT_TRUE(out.contains("subscriptions"));
+    };
+    withClient(body);
+}
+
+TEST(GraphqlEndpoint, EventsInjectionEndpoint)
+{
+    auto body = [](HttpClient& client) -> Task<void> {
+        HttpRequest req{http::verb::post, "/graphql/events", 11};
+        req.set(http::field::content_type, "application/json");
+        req.body() = R"({"fields": ["sensorUpdates", "chassisUpdates"]})";
+        auto res = co_await client.send(std::move(req));
+        EXPECT_EQ(res.result(), http::status::ok);
+        json out = json::parse(res.body());
+        EXPECT_EQ(out["fired"], true);
+        EXPECT_EQ(out["fields"].size(), 2u);
+
+        // Invalid requests
+        HttpRequest badReq{http::verb::post, "/graphql/events", 11};
+        badReq.set(http::field::content_type, "application/json");
+        badReq.body() = R"({"fields": []})";
+        auto badRes = co_await client.send(std::move(badReq));
+        EXPECT_EQ(badRes.result(), http::status::bad_request);
+    };
+    withClient(body);
 }

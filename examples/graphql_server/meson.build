@@ -14,9 +14,15 @@ executable(
     dependencies: sutra_dbus_dep,
     cpp_args: [
         '-DSUTRA_EXAMPLE_SCHEMA="' + default_schema + '"',
-        # Log everything (debug and up) to the journal.
-        '-DSUTRA_LOG_LEVEL=0',
+        # Log info and up to the journal; debug calls are compiled out to keep
+        # the binary small. Use -DSUTRA_LOG_LEVEL=0 when debugging.
+        '-DSUTRA_LOG_LEVEL=1',
     ],
+    # Size: no RTTI (Asio falls back to BOOST_ASIO_NO_TYPEID automatically) and
+    # hidden symbol visibility (-fvisibility=hidden and
+    # -fvisibility-inlines-hidden) for a smaller dynamic symbol table.
+    override_options: ['cpp_rtti=false'],
+    gnu_symbol_visibility: 'hidden',
     install: get_option('install_example'),
 )
 

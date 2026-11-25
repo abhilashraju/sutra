@@ -42,6 +42,27 @@ inline nlohmann::json schemaJson()
     {"name": "chassis", "returnType": "Chassis", "source": "memory"},
     {"name": "version", "returnType": "String", "scalar": true,
      "source": "memory"}
+  ],
+  "subscriptions": [
+    {"name": "sensorUpdates", "returnType": "Sensor", "isList": true,
+     "source": "memory"},
+    {"name": "sensorStatus", "returnType": "Sensor", "source": "memory",
+     "arguments": [{"name": "id", "typeName": "String", "required": true}]},
+    {"name": "chassisUpdates", "returnType": "Chassis", "source": "memory"}
+  ],
+  "dbusWatchers": [
+    {
+      "dbusObject": "/xyz/openbmc_project/sensors/temp_cpu",
+      "dbusInterface": "xyz.openbmc_project.Sensor.Value",
+      "dbusProperty": "Value",
+      "graphqlFields": ["sensorUpdates", "sensorStatus"]
+    },
+    {
+      "dbusObject": "",
+      "dbusInterface": "xyz.openbmc_project.State.Chassis",
+      "dbusProperty": "CurrentPowerState",
+      "graphqlFields": ["chassisUpdates"]
+    }
   ]
 })");
 }
@@ -61,10 +82,14 @@ inline std::shared_ptr<sutra::graphql::MemorySource> makeMemory()
     memory->set("sensor", sensors);
     memory->set("chassis", {{"Name", "chassis0"}, {"Sensors", sensors}});
     memory->set("version", "1.2.3");
+    memory->set("sensorUpdates", sensors);
+    memory->set("sensorStatus", sensors);
+    memory->set("chassisUpdates", {{"Name", "chassis0"}, {"Sensors", sensors}});
     return memory;
 }
 
-inline std::shared_ptr<sutra::graphql::Executor> makeExecutor()
+inline std::shared_ptr<sutra::graphql::Executor> makeExecutor(
+    std::optional<sutra::net::any_io_executor> ioExec = std::nullopt)
 {
     using namespace sutra::graphql;
     auto schema = Schema::fromJson(schemaJson());
@@ -76,7 +101,8 @@ inline std::shared_ptr<sutra::graphql::Executor> makeExecutor()
     {
         throw std::runtime_error(applied.error());
     }
-    return std::make_shared<Executor>(std::move(*schema), registry);
+    return std::make_shared<Executor>(std::move(*schema), registry,
+                                      std::move(ioExec));
 }
 
 } // namespace graphql_fixture

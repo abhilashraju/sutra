@@ -89,22 +89,14 @@ class HttpServer
         }
         TlsConnection tls(
             ssl::stream<tcp::socket>(std::move(plain.stream()), *tlsContext));
-        bool handshakeOk = true;
-        try
-        {
-            co_await tls.handshake(ssl::stream_base::server,
-                                   options.handshakeTimeout);
-        }
-        catch (const system_error& e)
+        if (auto ec = co_await tls.tryHandshake(ssl::stream_base::server,
+                                                options.handshakeTimeout))
         {
             logDebug("tls handshake with {} failed: {}",
-                     remote.address().to_string(), e.code().message());
-            handshakeOk = false;
+                     remote.address().to_string(), ec.message());
+            co_return;
         }
-        if (handshakeOk)
-        {
-            co_await serve(tls, remote);
-        }
+        co_await serve(tls, remote);
     }
 
     enum class ReadOutcome
@@ -119,34 +111,25 @@ class HttpServer
     Task<ReadOutcome> readRequest(Connection<Stream>& conn,
                                   http::request_parser<http::string_body>& p)
     {
-        ReadOutcome outcome = ReadOutcome::request;
-        try
+        const auto code = co_await conn.tryRun([&](auto token) {
+            return http::async_read(conn.stream(), conn.buffer(), p, token);
+        });
+        if (!code)
         {
-            co_await conn.run([&](auto token) {
-                return http::async_read(conn.stream(), conn.buffer(), p, token);
-            });
+            co_return ReadOutcome::request;
         }
-        catch (const system_error& e)
+        if (code == http::error::body_limit)
         {
-            const auto code = e.code();
-            if (code == http::error::body_limit)
-            {
-                outcome = ReadOutcome::tooLarge;
-            }
-            else if (code == http::error::end_of_stream ||
-                     code.category() !=
-                         http::make_error_code(http::error::bad_method)
-                             .category())
-            {
-                // Peer went away, timed out, or the transport failed.
-                outcome = ReadOutcome::closed;
-            }
-            else
-            {
-                outcome = ReadOutcome::badRequest;
-            }
+            co_return ReadOutcome::tooLarge;
         }
-        co_return outcome;
+        if (code == http::error::end_of_stream ||
+            code.category() !=
+                http::make_error_code(http::error::bad_method).category())
+        {
+            // Peer went away, timed out, or the transport failed.
+            co_return ReadOutcome::closed;
+        }
+        co_return ReadOutcome::badRequest;
     }
 
     template <class Stream>
@@ -215,19 +198,14 @@ class HttpServer
     template <class Stream>
     static Task<bool> send(Connection<Stream>& conn, HttpResponse& res)
     {
-        bool ok = true;
-        try
+        const auto ec = co_await conn.tryRun([&](auto token) {
+            return http::async_write(conn.stream(), res, token);
+        });
+        if (ec)
         {
-            co_await conn.run([&](auto token) {
-                return http::async_write(conn.stream(), res, token);
-            });
+            logDebug("response write failed: {}", ec.message());
         }
-        catch (const system_error& e)
-        {
-            logDebug("response write failed: {}", e.code().message());
-            ok = false;
-        }
-        co_return ok;
+        co_return !ec;
     }
 
     template <class Stream>
@@ -241,16 +219,7 @@ class HttpServer
             "Cache-Control: no-cache\r\n"
             "Transfer-Encoding: chunked\r\n"
             "Connection: close\r\n\r\n";
-        bool headSent = true;
-        try
-        {
-            co_await conn.write(head);
-        }
-        catch (const system_error&)
-        {
-            headSent = false;
-        }
-        if (!headSent)
+        if (co_await conn.tryWrite(head))
         {
             co_return;
         }
@@ -275,16 +244,7 @@ class HttpServer
             std::string chunk = std::format("{:x}\r\n", frame.size());
             chunk += frame;
             chunk += "\r\n";
-            bool ok = true;
-            try
-            {
-                co_await conn.write(chunk);
-            }
-            catch (const system_error&)
-            {
-                ok = false;
-            }
-            co_return ok;
+            co_return !co_await conn.tryWrite(chunk);
         });
 
         try
@@ -295,12 +255,7 @@ class HttpServer
         {
             logDebug("sse handler for {} ended: {}", ctx.path, e.what());
         }
-        try
-        {
-            co_await conn.write("0\r\n\r\n");
-        }
-        catch (const system_error&)
-        {}
+        co_await conn.tryWrite("0\r\n\r\n");
         co_await conn.gracefulClose();
     }
 

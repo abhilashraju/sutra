@@ -4,6 +4,8 @@
 #include "sutra/graphql/error.hpp"
 
 #include <cctype>
+#include <charconv>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -555,33 +557,32 @@ class Parser
             {
                 std::string value = current.text;
                 advance();
-                try
-                {
-                    long long parsed = std::stoll(value);
-                    if (parsed >= std::numeric_limits<int>::min() &&
-                        parsed <= std::numeric_limits<int>::max())
-                    {
-                        return {Value::Kind::Int, static_cast<int>(parsed)};
-                    }
-                    return {Value::Kind::Int, parsed};
-                }
-                catch (...)
+                long long parsed = 0;
+                if (std::from_chars(value.data(), value.data() + value.size(),
+                                    parsed)
+                        .ec != std::errc())
                 {
                     return {Value::Kind::Int, value};
                 }
+                if (parsed >= std::numeric_limits<int>::min() &&
+                    parsed <= std::numeric_limits<int>::max())
+                {
+                    return {Value::Kind::Int, static_cast<int>(parsed)};
+                }
+                return {Value::Kind::Int, parsed};
             }
             if (current.type == TokenType::Float)
             {
                 std::string value = current.text;
                 advance();
-                try
-                {
-                    return {Value::Kind::Float, std::stod(value)};
-                }
-                catch (...)
+                double parsed = 0;
+                if (std::from_chars(value.data(), value.data() + value.size(),
+                                    parsed)
+                        .ec != std::errc())
                 {
                     return {Value::Kind::Float, value};
                 }
+                return {Value::Kind::Float, parsed};
             }
             if (current.type == TokenType::LeftBracket)
             {

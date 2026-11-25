@@ -221,6 +221,7 @@ class Executor : public std::enable_shared_from_this<Executor>
     Task<nlohmann::json> execute(
         std::string query, nlohmann::json variables = nlohmann::json::object())
     {
+        clearAllSourceCaches();
         Result<Operation> parsed = Parser::tryParse(query);
         if (!parsed)
         {
@@ -305,6 +306,24 @@ class Executor : public std::enable_shared_from_this<Executor>
     const std::vector<DbusWatcher>& getDbusWatchers() const
     {
         return schema.getDbusWatchers();
+    }
+
+    /** @brief Clear the response cache on every registered data source.
+     *
+     * Automatically called at the start of each `execute()` and before each
+     * subscription poll tick (after the trigger fires). Sources that do not
+     * cache anything treat this as a no-op.
+     */
+    void clearAllSourceCaches()
+    {
+        if (!sources)
+        {
+            return;
+        }
+        for (const auto& [name, src] : sources->all())
+        {
+            src->clearCache();
+        }
     }
 
     // Called by D-Bus property watcher or external event injection with the
@@ -471,6 +490,7 @@ class Executor : public std::enable_shared_from_this<Executor>
             {
                 break;
             }
+            clearAllSourceCaches();
         }
 
         activeSubscriptions.erase(session->key);

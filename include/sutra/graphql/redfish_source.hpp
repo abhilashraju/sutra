@@ -38,12 +38,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace sutra::graphql
@@ -270,6 +272,9 @@ inline Task<std::optional<nlohmann::json>> fetchMember(
 
 } // namespace redfish_source_detail
 
+// Forward declaration for use inside RedfishSource::clearCache().
+class CachingRedfishBackend;
+
 /** @brief DataSource that fills a root field from a Redfish service. */
 class RedfishSource : public DataSource
 {
@@ -277,6 +282,14 @@ class RedfishSource : public DataSource
     explicit RedfishSource(std::shared_ptr<RedfishBackend> redfishBackend) :
         backend(std::move(redfishBackend))
     {}
+
+    void clearCache() override
+    {
+        if (auto* cb = dynamic_cast<CachingRedfishBackend*>(backend.get()))
+        {
+            cb->clearCache();
+        }
+    }
 
     Result<void> validate(const FieldSpec& fieldSpec) const override
     {
@@ -500,5 +513,73 @@ using RedfishHttpBackend = RedfishWebBackend<tcp::socket>;
 
 /** @brief HTTPS Redfish backend (certificates are always verified). */
 using RedfishHttpsBackend = RedfishWebBackend<ssl::stream<tcp::socket>>;
+
+/**
+ * @brief Wraps any RedfishBackend with a per-request-cycle response cache.
+ *
+ * During a single query or subscription poll cycle all GET requests issued for
+ * the same URL return the same cached JSON body without hitting the network
+ * again.  The cache is cleared by calling `clearCache()` before each new cycle
+ * — the executor calls this automatically through
+ * `RedfishSource::clearCache()`.
+ *
+ * `fetchFresh(target)` unconditionally bypasses the cache (used by subscription
+ * loops that want live data every tick).
+ *
+ * Usage:
+ * @code
+ * auto rawBackend = std::make_shared<RedfishHttpsBackend>(...);
+ * auto cachedBackend = std::make_shared<CachingRedfishBackend>(rawBackend);
+ * auto source = std::make_shared<RedfishSource>(cachedBackend);
+ * // Before each subscription tick:
+ * source->clearCache();
+ * @endcode
+ */
+class CachingRedfishBackend : public RedfishBackend
+{
+  public:
+    explicit CachingRedfishBackend(std::shared_ptr<RedfishBackend> inner) :
+        inner(std::move(inner))
+    {}
+
+    /** @brief GET with caching: returns a cached copy if the URL was already
+     *         fetched since the last clearCache(). */
+    Task<Result<nlohmann::json>> get(std::string target) override
+    {
+        auto it = cache.find(target);
+        if (it != cache.end())
+        {
+            co_return it->second;
+        }
+        auto result = co_await inner->get(target);
+        if (result)
+        {
+            cache.emplace(target, *result);
+        }
+        co_return result;
+    }
+
+    /** @brief GET bypassing the cache (always fetches live data). */
+    Task<Result<nlohmann::json>> getFresh(const std::string& target)
+    {
+        return inner->get(target);
+    }
+
+    /** @brief Discard all cached responses. Call before each subscription
+     *         poll tick so each cycle sees fresh data. */
+    void clearCache()
+    {
+        cache.clear();
+    }
+
+    std::size_t cacheSize() const
+    {
+        return cache.size();
+    }
+
+  private:
+    std::shared_ptr<RedfishBackend> inner;
+    std::unordered_map<std::string, nlohmann::json> cache;
+};
 
 } // namespace sutra::graphql

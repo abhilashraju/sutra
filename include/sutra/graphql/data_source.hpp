@@ -54,6 +54,15 @@ class DataSource
         co_return std::unexpected(
             "Link traversal not supported by this data source");
     }
+
+    /**
+     * @brief Discard any per-request cached state.
+     *
+     * Called by the Executor at the start of each query execution and before
+     * each subscription poll tick. The default implementation is a no-op.
+     * Sources that cache responses (e.g. CachingRedfishBackend) override this.
+     */
+    virtual void clearCache() {}
 };
 
 /** @brief Name to DataSource lookup. */
@@ -74,6 +83,13 @@ class SourceRegistry
     bool has(const std::string& name) const
     {
         return sources.contains(name);
+    }
+
+    /** @brief Iterate all registered sources (name → source). */
+    const std::unordered_map<std::string, std::shared_ptr<DataSource>>& all()
+        const
+    {
+        return sources;
     }
 
   private:

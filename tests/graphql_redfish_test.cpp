@@ -370,3 +370,61 @@ TEST(RedfishWebBackend, RejectsBadBaseUrl)
     EXPECT_THROW(RedfishHttpBackend(pool, "http://host/redfish/v1"),
                  std::invalid_argument);
 }
+
+TEST(CachingRedfishBackend, CachesResponseAndClearsOnRequest)
+{
+    auto fake = std::make_shared<FakeRedfish>();
+    fake->tree["/redfish/v1"] = {{"Id", "RootService"}};
+
+    auto cached = std::make_shared<CachingRedfishBackend>(fake);
+
+    net::io_context ioc;
+    exec::async_scope scope;
+    json first, second, afterClear;
+    std::size_t callsBefore{}, callsAfter{};
+
+    auto body = [&]() -> Task<void> {
+        // First fetch goes to backend.
+        auto r1 = co_await cached->get("/redfish/v1");
+        first = r1 ? *r1 : json(nullptr);
+        callsBefore = fake->calls.size();
+
+        // Second fetch should hit the cache (no new backend call).
+        auto r2 = co_await cached->get("/redfish/v1");
+        second = r2 ? *r2 : json(nullptr);
+        EXPECT_EQ(fake->calls.size(), callsBefore); // no new call
+
+        // After clearing the cache the backend is called again.
+        cached->clearCache();
+        EXPECT_EQ(cached->cacheSize(), 0u);
+        auto r3 = co_await cached->get("/redfish/v1");
+        afterClear = r3 ? *r3 : json(nullptr);
+        callsAfter = fake->calls.size();
+    };
+
+    spawnTask(scope, body(), "cache test");
+    ioc.run();
+
+    EXPECT_EQ(first["Id"], "RootService");
+    EXPECT_EQ(second["Id"], "RootService");
+    EXPECT_EQ(afterClear["Id"], "RootService");
+    EXPECT_EQ(callsBefore, 1u);         // cached after first fetch
+    EXPECT_GT(callsAfter, callsBefore); // cleared → one more call
+}
+
+TEST(CachingRedfishBackend, ExecutorClearsBeforeEachQuery)
+{
+    auto fake = makeFake();
+    auto cachedBackend = std::make_shared<CachingRedfishBackend>(fake);
+    Executor executor = makeExecutor(cachedBackend);
+
+    // First query.
+    std::size_t callsAfterFirst = 0;
+    run(executor, R"({ chassis(id: "c1") { Id } })");
+    callsAfterFirst = fake->calls.size();
+
+    // Second query for the same resource: cache is cleared between execute()
+    // calls so the backend must be called again.
+    run(executor, R"({ chassis(id: "c1") { Id } })");
+    EXPECT_GT(fake->calls.size(), callsAfterFirst);
+}

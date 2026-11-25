@@ -41,6 +41,13 @@ struct ConnectionPoolConfig
     std::chrono::steady_clock::duration acquireTimeout = 10s;
     /** Limit for resolve + connect (+ TLS handshake) of a new connection. */
     std::chrono::steady_clock::duration connectTimeout = 10s;
+    /**
+     * TLS pools only: when not empty, SNI and certificate-name verification
+     * use this name instead of the host being connected to. Verification stays
+     * on; this is for servers whose certificate names differ from the address
+     * used to reach them (for example `127.0.0.1` vs `CN=bmc.peer`).
+     */
+    std::string tlsServerName;
     /** Per-operation limit applied to connections handed out. */
     std::chrono::steady_clock::duration requestTimeout = 60s;
 };
@@ -358,7 +365,7 @@ class ConnectionPoolT :
         Reservation reservation{*this, state};
         auto client = std::make_unique<Client>(executor, tlsContext);
         client->setConnectTimeout(config.connectTimeout);
-        co_await client->connect(key.host, key.port);
+        co_await client->connect(key.host, key.port, config.tlsServerName);
         client->setTimeout(config.requestTimeout);
         reservation.armed = false;
         co_return Lease(std::move(self), std::move(key), std::move(client),

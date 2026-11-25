@@ -170,6 +170,8 @@ class Executor
         }
         if (!payload)
         {
+            logWarning("graphql: source '{}' returned an error for '{}': {}",
+                       fieldSpec.source, fieldSpec.name, payload.error());
             co_return std::unexpected(payload.error());
         }
 

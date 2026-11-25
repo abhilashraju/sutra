@@ -5,14 +5,20 @@ Wants=xyz.openbmc_project.ObjectMapper.service
 
 [Service]
 Type=simple
-# GraphQL on 127.0.0.1:18081, Redfish source on https://127.0.0.1:443 (user
-# "service"), D-Bus source on the system bus.
+# GraphQL over HTTPS on 127.0.0.1:18081 with bmcweb's certificate, Redfish
+# source on https://127.0.0.1:443 (user "service") verified against the CA
+# directory /etc/ssl/certs/authority. bmcweb's certificate is issued to
+# CN=bmc.peer (no SAN), so --redfish-server-name makes the client verify that
+# name while still connecting to 127.0.0.1. D-Bus source on the system bus.
 ExecStart=/usr/bin/graphql_server \
     --address 127.0.0.1 --port 18081 \
     --redfish https://127.0.0.1:443 \
     --redfish-user service \
     --schema /usr/share/sutra-graphql/schema.json \
-    --redfish-ca /etc/ssl/certs/https/server.pem \
+    --cert /etc/ssl/certs/https/server_cert.pem \
+    --key /etc/ssl/private/server_pkey.pem \
+    --redfish-ca /etc/ssl/certs/authority \
+    --redfish-server-name bmc.peer \
     --bus system
 # Holds the secret, never put it on the command line:
 #   SUTRA_REDFISH_PASSWORD=...

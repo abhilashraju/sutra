@@ -12,7 +12,9 @@ TMP=$(mktemp -d)
 python3 "$HERE/examples/graphql_server/demo_bus.py" &
 BUSPID=$!
 sleep 1
-"$SERVER" --address 127.0.0.1 --port $PORT --bus session --tls \
+# --redfish points at a closed local port: this demo only queries dbus* fields.
+"$SERVER" --address 127.0.0.1 --port $PORT --bus session \
+    --redfish http://127.0.0.1:9 \
     >"$TMP/server.out" 2>"$TMP/server.err" &
 PID=$!
 trap 'kill $PID $BUSPID 2>/dev/null; rm -rf "$TMP"' EXIT

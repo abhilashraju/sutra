@@ -11,14 +11,13 @@ SRC_URI = "git://github.com/abhilashraju/sutra.git;branch=main;protocol=https"
 # Pin to a commit for reproducible builds.
 SRCREV = "${AUTOREV}"
 
-S = "${WORKDIR}/git"
-
 # Needs GCC 14+ (C++23, std::expected) and Boost >= 1.86.
 DEPENDS = " \
     boost \
     nlohmann-json \
     openssl \
     stdexec \
+    systemd \
 "
 
 inherit meson pkgconfig systemd
@@ -32,7 +31,7 @@ EXTRA_OEMESON += " \
 # dbus: the D-Bus data source (graphql_server --bus system|session).
 # tests: build the GoogleTest unit tests (not installed).
 PACKAGECONFIG ??= "dbus"
-PACKAGECONFIG[dbus] = "-Ddbus=enabled,-Ddbus=disabled,sdbusplus systemd"
+PACKAGECONFIG[dbus] = "-Ddbus=enabled,-Ddbus=disabled,sdbusplus"
 PACKAGECONFIG[tests] = "-Dtests=enabled,-Dtests=disabled,googletest"
 
 # The Redfish password (SUTRA_REDFISH_PASSWORD) lives here, outside the unit.
@@ -51,5 +50,8 @@ do_install:append() {
 ENVFILE
     chmod 0600 ${D}${sysconfdir}/default/sutra-graphql
 }
+
+FILES:${PN} += "${datadir}/sutra-graphql"
+CONFFILES:${PN} += "${sysconfdir}/default/sutra-graphql"
 
 SYSTEMD_SERVICE:${PN} = "sutra-graphql.service"

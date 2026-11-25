@@ -11,7 +11,13 @@
 #include "sutra/connection.hpp"
 #include "sutra/tcp_client.hpp"
 
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+#include <algorithm>
+#include <cctype>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -89,28 +95,47 @@ class HttpClientT : public Connection<Stream>
 
     /**
      * @brief Resolves, connects and (for TLS) handshakes with SNI and
-     *        certificate-name verification against `host`.
+     *        certificate-name verification against `host`, or against
+     *        `tlsServerName` when that is not empty. An explicit
+     *        `tlsServerName` also accepts a certificate that has no DNS/IP
+     *        SAN and whose subject CN equals it.
      */
-    Task<void> connect(std::string host, std::string port)
+    Task<void> connect(std::string host, std::string port,
+                       [[maybe_unused]] std::string tlsServerName = {})
     {
+        auto verifyFailure = std::make_shared<std::string>();
         if constexpr (isTls)
         {
             // Set SNI and make the handshake verify the certificate name.
+            const std::string name =
+                tlsServerName.empty() ? host : tlsServerName;
             if (!SSL_set_tlsext_host_name(this->stream().native_handle(),
-                                          host.c_str()))
+                                          name.c_str()))
             {
                 throw system_error(
                     error_code(static_cast<int>(::ERR_get_error()),
                                net::error::get_ssl_category()));
             }
-            this->stream().set_verify_callback(
-                ssl::host_name_verification(host));
+            this->stream().set_verify_callback(verifyAndRecordReason(
+                name, verifyFailure, !tlsServerName.empty()));
         }
         co_await connectStream(*this, executor, host, std::move(port),
                                connectTimeout);
         if constexpr (isTls)
         {
-            co_await this->handshake(ssl::stream_base::client, connectTimeout);
+            try
+            {
+                co_await this->handshake(ssl::stream_base::client,
+                                         connectTimeout);
+            }
+            catch (const system_error& e)
+            {
+                if (verifyFailure->empty())
+                {
+                    throw;
+                }
+                throw system_error(e.code(), *verifyFailure);
+            }
         }
         peerHost = std::move(host);
     }
@@ -187,6 +212,150 @@ class HttpClientT : public Connection<Stream>
             req.set(http::field::host, peerHost);
         }
         req.prepare_payload();
+    }
+
+    /** @return "subject=<one line> san=<DNS names>" of `cert`, for errors. */
+    static std::string describeCertificate(X509* cert)
+    {
+        std::string out = "subject=";
+        char* subject =
+            X509_NAME_oneline(X509_get_subject_name(cert), nullptr, 0);
+        if (subject != nullptr)
+        {
+            out += subject;
+            OPENSSL_free(subject);
+        }
+        out += " san=";
+        GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(
+            X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+        if (names == nullptr)
+        {
+            return out + "none";
+        }
+        for (int i = 0; i < sk_GENERAL_NAME_num(names); ++i)
+        {
+            const GENERAL_NAME* gen = sk_GENERAL_NAME_value(names, i);
+            if (gen->type == GEN_DNS)
+            {
+                const ASN1_IA5STRING* dns = gen->d.dNSName;
+                out.append(
+                    reinterpret_cast<const char*>(ASN1_STRING_get0_data(dns)),
+                    static_cast<size_t>(ASN1_STRING_length(dns)));
+                out += ',';
+            }
+            else if (gen->type == GEN_IPADD)
+            {
+                out += "IP,";
+            }
+        }
+        GENERAL_NAMES_free(names);
+        return out;
+    }
+
+    /** @return true when `cert` has a DNS or IP subject alternative name. */
+    static bool hasDnsOrIpSan(X509* cert)
+    {
+        GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(
+            X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+        if (names == nullptr)
+        {
+            return false;
+        }
+        bool found = false;
+        for (int i = 0; i < sk_GENERAL_NAME_num(names) && !found; ++i)
+        {
+            const int type = sk_GENERAL_NAME_value(names, i)->type;
+            found = type == GEN_DNS || type == GEN_IPADD;
+        }
+        GENERAL_NAMES_free(names);
+        return found;
+    }
+
+    /**
+     * @brief Legacy subject-CN match for certificates without a DNS/IP SAN.
+     *
+     * Newer OpenSSL releases (4.1) no longer fall back to the CN, but some
+     * BMC certificates are issued with only `CN=<name>`. Used only for a name
+     * the operator configured explicitly; exact, case-insensitive, no
+     * wildcards. The chain has already been verified by then.
+     */
+    static bool commonNameEquals(X509* cert, const std::string& name)
+    {
+        if (hasDnsOrIpSan(cert))
+        {
+            return false;
+        }
+        const auto* subject = X509_get_subject_name(cert);
+        for (int i = X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+             i >= 0; i = X509_NAME_get_index_by_NID(subject, NID_commonName, i))
+        {
+            unsigned char* utf8 = nullptr;
+            const int length = ASN1_STRING_to_UTF8(
+                &utf8,
+                X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, i)));
+            if (length < 0)
+            {
+                continue;
+            }
+            const std::string_view cn(reinterpret_cast<char*>(utf8),
+                                      static_cast<size_t>(length));
+            const bool same =
+                std::equal(cn.begin(), cn.end(), name.begin(), name.end(),
+                           [](unsigned char a, unsigned char b) {
+                               return std::tolower(a) == std::tolower(b);
+                           });
+            OPENSSL_free(utf8);
+            if (same)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Certificate-name verification for `name` that also records why a
+     *        certificate was rejected in `failure` (OpenSSL's own reason for a
+     *        chain problem, or the name that did not match).
+     * @param allowCommonName also accept a SAN-less certificate whose subject
+     *        CN equals `name` (see commonNameEquals()).
+     */
+    static auto verifyAndRecordReason(std::string name,
+                                      std::shared_ptr<std::string> failure,
+                                      bool allowCommonName)
+    {
+        return [name, failure, allowCommonName,
+                hostCheck = ssl::host_name_verification(
+                    name)](bool preverified, ssl::verify_context& ctx) {
+            bool ok = hostCheck(preverified, ctx);
+            if (!ok && preverified && allowCommonName &&
+                X509_STORE_CTX_get_error_depth(ctx.native_handle()) == 0)
+            {
+                ok = commonNameEquals(
+                    X509_STORE_CTX_get_current_cert(ctx.native_handle()), name);
+            }
+            if (!ok && failure->empty())
+            {
+                X509_STORE_CTX* store = ctx.native_handle();
+                const int depth = X509_STORE_CTX_get_error_depth(store);
+                if (!preverified)
+                {
+                    *failure = std::string("certificate verify failed: ") +
+                               X509_verify_cert_error_string(
+                                   X509_STORE_CTX_get_error(store)) +
+                               " (depth " + std::to_string(depth) + ")";
+                }
+                else
+                {
+                    *failure =
+                        "certificate does not match the name '" + name + "' (" +
+                        describeCertificate(
+                            X509_STORE_CTX_get_current_cert(store)) +
+                        ")";
+                }
+            }
+            return ok;
+        };
     }
 
     /** @brief Joins the `data:` lines of one SSE event. */

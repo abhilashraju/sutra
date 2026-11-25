@@ -17,6 +17,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -85,11 +86,20 @@ inline PemPair generateSelfSignedCertificate(
                     static_cast<long>(validDays) * 24 * 3600);
     X509_set_pubkey(cert.get(), key.get());
 
-    X509_NAME* name = X509_get_subject_name(cert.get());
-    X509_NAME_add_entry_by_txt(
-        name, "CN", MBSTRING_ASC,
-        reinterpret_cast<const unsigned char*>(commonName.c_str()), -1, -1, 0);
-    X509_set_issuer_name(cert.get(), name);
+    // Build the name ourselves: X509_get_subject_name() returns a const
+    // pointer in OpenSSL 4, so it cannot be filled in place.
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name(
+        X509_NAME_new(), X509_NAME_free);
+    if (!name ||
+        X509_NAME_add_entry_by_txt(
+            name.get(), "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>(commonName.c_str()), -1, -1,
+            0) != 1 ||
+        X509_set_subject_name(cert.get(), name.get()) != 1 ||
+        X509_set_issuer_name(cert.get(), name.get()) != 1)
+    {
+        details::opensslFailure("subject name failed");
+    }
 
     X509V3_CTX v3;
     X509V3_set_ctx(&v3, cert.get(), cert.get(), nullptr, nullptr, 0);
@@ -159,6 +169,29 @@ inline ssl::context makeClientContext(const std::string& trustedPem = {})
         ctx.add_certificate_authority(
             net::buffer(trustedPem.data(), trustedPem.size()));
     }
+    return ctx;
+}
+
+/**
+ * @brief TLS 1.2+ client context that trusts the CAs in a directory.
+ * @param caPath OpenSSL "CApath": a directory of PEM certificates, each
+ *               reachable through its subject hash (`<hash>.0`, as created by
+ *               `openssl rehash`). Nothing else is trusted.
+ * @throws std::runtime_error when `caPath` is not a directory.
+ */
+inline ssl::context makeClientContextWithCaPath(const std::string& caPath)
+{
+    if (!std::filesystem::is_directory(caPath))
+    {
+        throw std::runtime_error("CA path '" + caPath + "' is not a directory");
+    }
+    ssl::context ctx(ssl::context::tls_client);
+    ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 |
+                    ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
+                    ssl::context::no_tlsv1_1);
+    SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION);
+    ctx.set_verify_mode(ssl::verify_peer);
+    ctx.add_verify_path(caPath);
     return ctx;
 }
 

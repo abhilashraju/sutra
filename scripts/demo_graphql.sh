@@ -11,7 +11,7 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/usr/local/gcc-15/lib64}
 
 python3 "$HERE/examples/graphql_server/demo_redfish.py" $REDFISH_PORT &
 REDFISH_PID=$!
-"$SERVER" --address 127.0.0.1 --port $PORT \
+"$SERVER" --address 127.0.0.1 --port $PORT --no-tls \
     --redfish http://127.0.0.1:$REDFISH_PORT &
 PID=$!
 trap 'kill $PID $REDFISH_PID 2>/dev/null' EXIT

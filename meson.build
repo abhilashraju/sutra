@@ -48,12 +48,21 @@ boost_dep = declare_dependency(
 openssl_dep = dependency('openssl', required: true)
 threads_dep = dependency('threads')
 json_dep = dependency('nlohmann_json', required: true)
+# sutra/log.hpp writes to the journal (sd_journal_send).
+systemd_dep = dependency('libsystemd', required: true)
 
 sutra_inc = include_directories('include')
 
 sutra_dep = declare_dependency(
     include_directories: sutra_inc,
-    dependencies: [stdexec_dep, boost_dep, openssl_dep, threads_dep, json_dep],
+    dependencies: [
+        stdexec_dep,
+        boost_dep,
+        openssl_dep,
+        threads_dep,
+        json_dep,
+        systemd_dep,
+    ],
 )
 
 # ---------------------------------------------------------------------------
@@ -65,11 +74,10 @@ sutra_dep = declare_dependency(
 # library and the systemd dependency are taken from the system.
 # ---------------------------------------------------------------------------
 sdbusplus_lib = cxx.find_library('sdbusplus', required: get_option('dbus'))
-systemd_dep = dependency('libsystemd', required: get_option('dbus'))
-have_dbus = sdbusplus_lib.found() and systemd_dep.found()
+have_dbus = sdbusplus_lib.found()
 if have_dbus
     sutra_dbus_dep = declare_dependency(
-        dependencies: [sutra_dep, sdbusplus_lib, systemd_dep],
+        dependencies: [sutra_dep, sdbusplus_lib],
         compile_args: ['-DSUTRA_HAVE_DBUS=1'],
     )
 else

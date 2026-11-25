@@ -7,17 +7,22 @@
  * D-Bus support, the live bus ("dbus") is added as an optional second source.
  *
  *   graphql_server [--address 127.0.0.1] [--port 8080] [--schema FILE]
- *                  [--redfish URL] [--redfish-user NAME] [--redfish-ca FILE]
- *                  [--bus session|system|none] [--tls]
+ *                  [--redfish URL] [--redfish-user NAME] [--redfish-ca DIR]
+ *                  [--redfish-server-name NAME]
+ *                  [--bus session|system|none] [--no-tls]
  *                  [--cert FILE --key FILE]   (--help lists the short forms)
  *
  * Redfish secrets are read from the environment, never from the command
  * line: SUTRA_REDFISH_TOKEN (X-Auth-Token) or SUTRA_REDFISH_PASSWORD (with
  * --redfish-user, HTTP Basic).
  *
- * With --tls and no --cert/--key a throw-away self-signed certificate is
- * generated at start-up (the certificate is printed to stdout so clients can
- * pin it with `curl --cacert`). The server refuses wildcard addresses.
+ * The server speaks HTTPS unless --no-tls is given. Without --cert/--key a
+ * throw-away self-signed certificate is generated at start-up (printed to
+ * stdout so clients can pin it with `curl --cacert`). An https Redfish
+ * service is verified against the CA directory --redfish-ca (default
+ * /etc/ssl/certs/authority), and its certificate must carry the host in the
+ * URL, or --redfish-server-name when the certificate names a different host
+ * than the address used. The server refuses wildcard addresses.
  */
 #include "sutra/cert_generator.hpp"
 #include "sutra/command_line.hpp"
@@ -29,13 +34,16 @@
 #include "sutra/graphql/dbus_source.hpp"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifndef SUTRA_EXAMPLE_SCHEMA
 #define SUTRA_EXAMPLE_SCHEMA "schema.json"
@@ -46,18 +54,23 @@ using namespace sutra;
 namespace
 {
 
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
 struct Options
 {
     std::string address = "127.0.0.1";
-    uint16_t port = 8080;
+    uint16_t port = 18080;
     std::string schemaPath = SUTRA_EXAMPLE_SCHEMA;
     std::string redfishUrl = "https://127.0.0.1:443";
-    std::string bus = "none";
-    bool tls = false;
-    std::string certPath;
-    std::string keyPath;
+    std::string bus = "system";
+    bool tls = true;
+    std::string certPath = "/etc/ssl/certs/https/server_cert.pem";
+    std::string keyPath = "/etc/ssl/private/server_pkey.pem";
     std::string redfishUser;
-    std::string redfishCa;
+    std::string redfishCa = "/etc/ssl/certs/authority";
+    std::string redfishServerName;
 };
 
 CommandLine makeCommandLine()
@@ -73,15 +86,39 @@ CommandLine makeCommandLine()
                   "https://127.0.0.1:443)");
     cmd.addOption("--redfish-user", "NAME",
                   "Redfish user (password: SUTRA_REDFISH_PASSWORD)");
-    cmd.addOption("--redfish-ca", "FILE",
-                  "CA certificate (PEM) to trust for an https Redfish service");
+    cmd.addOption("--redfish-ca", "DIR",
+                  "CA directory trusted for an https Redfish service "
+                  "(default /etc/ssl/certs/authority)");
+    cmd.addOption("--redfish-server-name", "NAME",
+                  "name the Redfish certificate must carry (SNI and "
+                  "verification), when it differs from the --redfish host");
     cmd.addOption("--bus,-b", "session|system|none",
                   "also read D-Bus fields from this bus (default none)");
-    cmd.addFlag("--tls,-t", "serve HTTPS");
+    cmd.addFlag("--no-tls", "serve plain HTTP instead of HTTPS");
     cmd.addOption("--cert,-c", "FILE", "TLS certificate (PEM)");
     cmd.addOption("--key,-k", "FILE", "TLS private key (PEM)");
     cmd.addFlag("--help,-h", "show this help");
     return cmd;
+}
+
+/** @return an error message when the combination of options is invalid. */
+std::optional<std::string> validateOptions(const Options& options)
+{
+    if (options.bus != "session" && options.bus != "system" &&
+        options.bus != "none")
+    {
+        return "option '--bus' must be session, system or none, got '" +
+               options.bus + "'";
+    }
+    if (options.certPath.empty() != options.keyPath.empty())
+    {
+        return "--cert and --key must be given together";
+    }
+    if (!options.tls && !options.certPath.empty())
+    {
+        return "--cert/--key cannot be used with --no-tls";
+    }
+    return std::nullopt;
 }
 
 /** @return the options, or an error message to print before the usage. */
@@ -91,12 +128,13 @@ std::expected<Options, std::string> readOptions(const CommandLine& cmd)
     options.address = cmd.valueOr("--address", options.address);
     options.schemaPath = cmd.valueOr("--schema", options.schemaPath);
     options.bus = cmd.valueOr("--bus", options.bus);
-    options.tls = cmd.isSet("--tls");
+    options.tls = !cmd.isSet("--no-tls");
     options.certPath = cmd.valueOr("--cert", "");
     options.keyPath = cmd.valueOr("--key", "");
     options.redfishUrl = cmd.valueOr("--redfish", options.redfishUrl);
     options.redfishUser = cmd.valueOr("--redfish-user", "");
-    options.redfishCa = cmd.valueOr("--redfish-ca", "");
+    options.redfishCa = cmd.valueOr("--redfish-ca", options.redfishCa);
+    options.redfishServerName = cmd.valueOr("--redfish-server-name", "");
 
     auto port = cmd.number<uint16_t>("--port");
     if (!port)
@@ -105,93 +143,19 @@ std::expected<Options, std::string> readOptions(const CommandLine& cmd)
     }
     options.port = port->value_or(options.port);
 
-    if (options.bus != "session" && options.bus != "system" &&
-        options.bus != "none")
+    if (auto problem = validateOptions(options))
     {
-        return std::unexpected("option '--bus' must be session, system or "
-                               "none, got '" +
-                               options.bus + "'");
-    }
-    if (options.certPath.empty() != options.keyPath.empty())
-    {
-        return std::unexpected("--cert and --key must be given together");
+        return std::unexpected(*problem);
     }
     return options;
 }
 
-std::optional<std::string> readFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-    {
-        return std::nullopt;
-    }
-    std::ostringstream text;
-    text << file.rdbuf();
-    return text.str();
-}
-
-/** @brief Registers the Redfish source for `options.redfishUrl`. */
-std::expected<void, std::string> addRedfishSource(
-    net::io_context& ioc, const Options& options,
-    graphql::SourceRegistry& registry)
-{
-    graphql::RedfishCredentials credentials;
-    if (const char* token = std::getenv("SUTRA_REDFISH_TOKEN"))
-    {
-        credentials.token = token;
-    }
-    if (const char* password = std::getenv("SUTRA_REDFISH_PASSWORD"))
-    {
-        credentials.password = password;
-    }
-    credentials.username = options.redfishUser;
-
-    try
-    {
-        std::shared_ptr<graphql::RedfishBackend> backend;
-        if (parseUrl(options.redfishUrl).tls)
-        {
-            std::string trusted;
-            if (!options.redfishCa.empty())
-            {
-                auto pem = readFile(options.redfishCa);
-                if (!pem)
-                {
-                    return std::unexpected("cannot read --redfish-ca file");
-                }
-                trusted = std::move(*pem);
-            }
-            auto context =
-                std::make_shared<ssl::context>(makeClientContext(trusted));
-            auto pool = HttpsConnectionPool::create(ioc.get_executor(),
-                                                    context.get(), {}, context);
-            backend = std::make_shared<graphql::RedfishHttpsBackend>(
-                pool, options.redfishUrl, credentials);
-        }
-        else
-        {
-            if (!credentials.token.empty() || !credentials.password.empty())
-            {
-                logWarning("sending Redfish credentials over plain http");
-            }
-            auto pool = HttpConnectionPool::create(ioc.get_executor());
-            backend = std::make_shared<graphql::RedfishHttpBackend>(
-                pool, options.redfishUrl, credentials);
-        }
-        registry.add(graphql::redfishSourceName,
-                     std::make_shared<graphql::RedfishSource>(backend));
-    }
-    catch (const std::exception& e)
-    {
-        return std::unexpected(std::string("--redfish: ") + e.what());
-    }
-    return {};
-}
-
-} // namespace
-
-int main(int argc, char** argv)
+/**
+ * @brief Parses argv into `options`.
+ * @return the process exit code when the program should end now (--help or a
+ *         usage error), nullopt to carry on.
+ */
+std::optional<int> parseCommandLine(int argc, char** argv, Options& options)
 {
     CommandLine cmd = makeCommandLine();
     if (auto parsed = cmd.parse(argc, argv); !parsed)
@@ -212,8 +176,290 @@ int main(int argc, char** argv)
                      cmd.usage(argv[0]).c_str());
         return 2;
     }
-    const Options options = *parsedOptions;
+    options = *parsedOptions;
+    return std::nullopt;
+}
 
+std::optional<std::string> readFile(const std::string& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        return std::nullopt;
+    }
+    std::ostringstream text;
+    text << file.rdbuf();
+    return text.str();
+}
+
+// ---------------------------------------------------------------------------
+// Data sources
+// ---------------------------------------------------------------------------
+
+/** @brief Redfish credentials: user from the options, secrets from the env. */
+graphql::RedfishCredentials readRedfishCredentials(const Options& options)
+{
+    graphql::RedfishCredentials credentials;
+    if (const char* token = std::getenv("SUTRA_REDFISH_TOKEN"))
+    {
+        credentials.token = token;
+    }
+    if (const char* password = std::getenv("SUTRA_REDFISH_PASSWORD"))
+    {
+        credentials.password = password;
+    }
+    credentials.username = options.redfishUser;
+    return credentials;
+}
+
+/** @brief Backend for an https Redfish service, verified against the CA dir. */
+std::shared_ptr<graphql::RedfishBackend> makeHttpsRedfishBackend(
+    net::io_context& ioc, const Options& options,
+    const graphql::RedfishCredentials& credentials)
+{
+    auto context = std::make_shared<ssl::context>(
+        makeClientContextWithCaPath(options.redfishCa));
+    ConnectionPoolConfig poolConfig;
+    poolConfig.tlsServerName = options.redfishServerName;
+    auto pool = HttpsConnectionPool::create(ioc.get_executor(), context.get(),
+                                            poolConfig, context);
+    return std::make_shared<graphql::RedfishHttpsBackend>(
+        pool, options.redfishUrl, credentials);
+}
+
+/** @brief Backend for a plain-http Redfish service (warns about secrets). */
+std::shared_ptr<graphql::RedfishBackend> makeHttpRedfishBackend(
+    net::io_context& ioc, const Options& options,
+    const graphql::RedfishCredentials& credentials)
+{
+    if (!credentials.token.empty() || !credentials.password.empty())
+    {
+        logWarning("sending Redfish credentials over plain http");
+    }
+    auto pool = HttpConnectionPool::create(ioc.get_executor());
+    return std::make_shared<graphql::RedfishHttpBackend>(
+        pool, options.redfishUrl, credentials);
+}
+
+/** @brief Registers the Redfish source for `options.redfishUrl`. */
+std::expected<void, std::string> addRedfishSource(
+    net::io_context& ioc, const Options& options,
+    graphql::SourceRegistry& registry)
+{
+    const auto credentials = readRedfishCredentials(options);
+    try
+    {
+        auto backend = parseUrl(options.redfishUrl).tls
+                           ? makeHttpsRedfishBackend(ioc, options, credentials)
+                           : makeHttpRedfishBackend(ioc, options, credentials);
+        registry.add(graphql::redfishSourceName,
+                     std::make_shared<graphql::RedfishSource>(backend));
+    }
+    catch (const std::exception& e)
+    {
+        return std::unexpected(std::string("--redfish: ") + e.what());
+    }
+    return {};
+}
+
+/**
+ * @brief Registers the optional D-Bus source for `--bus session|system`.
+ *
+ * A no-op without D-Bus support or with `--bus none`. The source owns the bus
+ * connection, so nothing needs to be kept by the caller.
+ */
+void addDbusSource([[maybe_unused]] net::io_context& ioc,
+                   [[maybe_unused]] const Options& options,
+                   [[maybe_unused]] graphql::SourceRegistry& registry)
+{
+#ifdef SUTRA_HAVE_DBUS
+    if (options.bus == "none")
+    {
+        return;
+    }
+    try
+    {
+        auto bus = std::make_shared<sdbusplus::asio::connection>(
+            ioc, options.bus == "session" ? sdbusplus::bus::new_user()
+                                          : sdbusplus::bus::new_system());
+        registry.add(graphql::dbusSourceName,
+                     std::make_shared<graphql::DbusSource>(
+                         std::make_shared<graphql::SutraDbusBackend>(bus)));
+    }
+    catch (const std::exception& e)
+    {
+        logWarning("D-Bus unavailable ({}); dbus fields are disabled",
+                   e.what());
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL executor and HTTP routes
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Binds the schema's fields to the registered sources.
+ *
+ * Fields whose source is not registered (no D-Bus support or no --bus) are
+ * dropped with a warning; a misconfigured source stays a hard error.
+ */
+std::expected<std::shared_ptr<graphql::Executor>, std::string> makeExecutor(
+    graphql::Schema schema, std::shared_ptr<graphql::SourceRegistry> registry)
+{
+    std::vector<std::string> warnings;
+    if (auto applied =
+            graphql::applySourceRegistry(schema, *registry, false, warnings);
+        !applied)
+    {
+        return std::unexpected("schema: " + applied.error());
+    }
+    for (const auto& warning : warnings)
+    {
+        logWarning("{}", warning);
+    }
+    return std::make_shared<graphql::Executor>(std::move(schema),
+                                               std::move(registry));
+}
+
+void addRoutes(HttpRouter& router,
+               const std::shared_ptr<graphql::Executor>& executor)
+{
+    graphql::registerGraphqlEndpoint(router, executor);
+    router.get("/health", [](HttpRequest&, RequestContext&) {
+        return jsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// TLS
+// ---------------------------------------------------------------------------
+
+/** @brief Generates a throw-away certificate and prints it for pinning. */
+PemPair makeSelfSignedPair()
+{
+    PemPair pair = generateSelfSignedCertificate(
+        "sutra-graphql", "DNS:localhost,IP:127.0.0.1", 1);
+    std::printf("%s", pair.certificate.c_str());
+    std::fflush(stdout);
+    return pair;
+}
+
+/** @brief Reads --cert/--key. */
+std::expected<PemPair, std::string> readPemPair(const Options& options)
+{
+    auto cert = readFile(options.certPath);
+    auto key = readFile(options.keyPath);
+    if (!cert || !key)
+    {
+        return std::unexpected("cannot read the certificate or key file");
+    }
+    return PemPair{std::move(*cert), std::move(*key)};
+}
+
+/** @return the server TLS context; nullopt when serving plain HTTP. */
+std::expected<std::optional<ssl::context>, std::string> loadTlsContext(
+    const Options& options)
+{
+    if (!options.tls)
+    {
+        return std::optional<ssl::context>();
+    }
+    if (options.certPath.empty())
+    {
+        PemPair pair = makeSelfSignedPair();
+        return std::optional<ssl::context>(
+            makeServerContext(pair.certificate, pair.privateKey));
+    }
+    auto pair = readPemPair(options);
+    if (!pair)
+    {
+        return std::unexpected(pair.error());
+    }
+    return std::optional<ssl::context>(
+        makeServerContext(pair->certificate, pair->privateKey));
+}
+
+// ---------------------------------------------------------------------------
+// Serving
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Stops the server and the event loop on SIGINT/SIGTERM.
+ *
+ * Stopping the server alone is not enough for run() to return: the D-Bus
+ * connection keeps a wait on the bus socket armed forever. So sessions get a
+ * moment to finish, then the loop is stopped explicitly.
+ */
+class ShutdownHandler
+{
+  public:
+    ShutdownHandler(net::io_context& context, HttpServer& httpServer) :
+        ioc(context), server(httpServer), signals(context, SIGINT, SIGTERM),
+        grace(context)
+    {
+        signals.async_wait([this](const error_code& ec, int) {
+            if (!ec)
+            {
+                shutDown();
+            }
+        });
+    }
+
+  private:
+    void shutDown()
+    {
+        logInfo("shutting down");
+        server.stop();
+        grace.expires_after(std::chrono::seconds(1));
+        grace.async_wait([this](const error_code&) { ioc.stop(); });
+    }
+
+    net::io_context& ioc;
+    HttpServer& server;
+    net::signal_set signals;
+    net::steady_timer grace;
+};
+
+std::unique_ptr<HttpServer> makeServer(
+    net::io_context& ioc, const Options& options, HttpRouter& router,
+    std::optional<ssl::context>& tlsContext)
+{
+    tcp::endpoint endpoint(net::ip::make_address(options.address),
+                           options.port);
+    if (tlsContext)
+    {
+        return std::make_unique<HttpServer>(ioc.get_executor(), endpoint,
+                                            router, *tlsContext);
+    }
+    return std::make_unique<HttpServer>(ioc.get_executor(), endpoint, router);
+}
+
+/** @brief Runs the server until a signal arrives. @return the exit code. */
+int serve(net::io_context& ioc, const Options& options, HttpRouter& router,
+          std::optional<ssl::context>& tlsContext)
+{
+    try
+    {
+        auto server = makeServer(ioc, options, router, tlsContext);
+        server->start();
+        ShutdownHandler shutdown(ioc, *server);
+        logInfo("listening on {}://{}:{}/graphql",
+                options.tls ? "https" : "http", options.address,
+                server->localEndpoint().port());
+        ioc.run();
+    }
+    catch (const std::exception& e)
+    {
+        logError("server failed: {}", e.what());
+        return 1;
+    }
+    return 0;
+}
+
+/** @brief Builds everything from `options` and serves. @return exit code. */
+int run(const Options& options)
+{
     auto schema = graphql::Schema::fromFile(options.schemaPath);
     if (!schema)
     {
@@ -228,108 +474,34 @@ int main(int argc, char** argv)
         logError("{}", added.error());
         return 1;
     }
+    addDbusSource(ioc, options, *registry);
 
-#ifdef SUTRA_HAVE_DBUS
-    std::shared_ptr<sdbusplus::asio::connection> bus;
-    if (options.bus != "none")
+    auto executor = makeExecutor(std::move(*schema), registry);
+    if (!executor)
     {
-        try
-        {
-            bus = std::make_shared<sdbusplus::asio::connection>(
-                ioc, options.bus == "session" ? sdbusplus::bus::new_user()
-                                              : sdbusplus::bus::new_system());
-            registry->add(
-                graphql::dbusSourceName,
-                std::make_shared<graphql::DbusSource>(
-                    std::make_shared<graphql::SutraDbusBackend>(bus)));
-        }
-        catch (const std::exception& e)
-        {
-            logWarning("D-Bus unavailable ({}); dbus fields are disabled",
-                       e.what());
-        }
-    }
-#endif
-
-    // Fields whose source is not registered (no D-Bus support or no --bus) are
-    // dropped; a misconfigured source stays a hard error.
-    std::vector<std::string> warnings;
-    if (auto applied =
-            graphql::applySourceRegistry(*schema, *registry, false, warnings);
-        !applied)
-    {
-        logError("schema: {}", applied.error());
+        logError("{}", executor.error());
         return 1;
     }
-    for (const auto& warning : warnings)
-    {
-        logWarning("{}", warning);
-    }
-
-    auto executor =
-        std::make_shared<graphql::Executor>(std::move(*schema), registry);
     HttpRouter router;
-    graphql::registerGraphqlEndpoint(router, executor);
-    router.get("/health", [](HttpRequest&, RequestContext&) {
-        return jsonResponse(http::status::ok, R"({"status":"ok"})");
-    });
+    addRoutes(router, *executor);
 
-    std::optional<ssl::context> tlsContext;
-    if (options.tls)
+    auto tlsContext = loadTlsContext(options);
+    if (!tlsContext)
     {
-        std::string certPem;
-        std::string keyPem;
-        if (options.certPath.empty())
-        {
-            PemPair pair = generateSelfSignedCertificate(
-                "sutra-graphql", "DNS:localhost,IP:127.0.0.1", 1);
-            certPem = pair.certificate;
-            keyPem = pair.privateKey;
-            std::printf("%s", certPem.c_str());
-            std::fflush(stdout);
-        }
-        else
-        {
-            auto cert = readFile(options.certPath);
-            auto key = readFile(options.keyPath);
-            if (!cert || !key)
-            {
-                logError("cannot read the certificate or key file");
-                return 1;
-            }
-            certPem = std::move(*cert);
-            keyPem = std::move(*key);
-        }
-        tlsContext.emplace(makeServerContext(certPem, keyPem));
-    }
-
-    try
-    {
-        tcp::endpoint endpoint(net::ip::make_address(options.address),
-                               options.port);
-        std::optional<HttpServer> server;
-        if (tlsContext)
-        {
-            server.emplace(ioc.get_executor(), endpoint, router, *tlsContext);
-        }
-        else
-        {
-            server.emplace(ioc.get_executor(), endpoint, router);
-        }
-        server->start();
-        net::signal_set signals(ioc, SIGINT, SIGTERM);
-        signals.async_wait([&server](const error_code&, int) {
-            server->stop();
-        });
-        logInfo("listening on {}://{}:{}/graphql",
-                options.tls ? "https" : "http", options.address,
-                server->localEndpoint().port());
-        ioc.run();
-    }
-    catch (const std::exception& e)
-    {
-        logError("server failed: {}", e.what());
+        logError("{}", tlsContext.error());
         return 1;
     }
-    return 0;
+    return serve(ioc, options, router, *tlsContext);
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    Options options;
+    if (auto exitCode = parseCommandLine(argc, argv, options))
+    {
+        return *exitCode;
+    }
+    return run(options);
 }

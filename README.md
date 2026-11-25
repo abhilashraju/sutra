@@ -19,8 +19,9 @@ hops onto one) or on stdexec's own pools.
 
 * GCC 14+ (developed with 15.2), C++23
 * meson >= 1.3, Boost >= 1.86 (headers), OpenSSL, nlohmann_json
+* libsystemd (`log.hpp` writes to the journal)
 * **stdexec with Asio support** (see below)
-* optional: sdbusplus + libsystemd (D-Bus layer, GraphQL D-Bus source)
+* optional: sdbusplus (D-Bus layer, GraphQL D-Bus source)
 * optional: GoogleTest (tests)
 
 ### Installing stdexec with Asio support
@@ -54,8 +55,13 @@ Notes:
 
 * Do **not** define `BOOST_ASIO_DISABLE_THREADS`: stdexec's `use_sender`
   relies on `std::recursive_mutex`. `sdbusplus.pc` injects that macro, so
-  `meson.build` links `libsdbusplus` and `libsystemd` directly instead of
-  using the pkg-config dependency.
+  `meson.build` links `libsdbusplus` directly instead of using the
+  pkg-config dependency.
+* Logging goes to the systemd journal by default (`sd_journal_send`, program
+  name as `SYSLOG_IDENTIFIER`, stderr only if the journal is unreachable).
+  `SUTRA_LOG_LEVEL` filters at compile time; `setLogSink()` replaces the
+  sink. Debug lines are sent at INFO priority, as in coroserver, because
+  OpenBMC's journald drops anything below INFO.
 * `BOOST_ASIO_NO_DEPRECATED` is on (`steady_timer::cancel()` takes no
   arguments).
 * Link `sutra_dep` for the core and `sutra_dbus_dep` for the D-Bus layer; the
@@ -251,14 +257,17 @@ graphql::registerGraphqlEndpoint(router, executor);
 backed by a Redfish service and, optionally, D-Bus.
 
 ```sh
-graphql_server --redfish https://bmc:443 --redfish-ca bmc-ca.pem \
+graphql_server --redfish https://bmc:443 --redfish-ca /etc/ssl/certs/authority \
                --redfish-user root               # Redfish service (default
-                                                 # https://127.0.0.1:443)
+                                                 # https://127.0.0.1:443, CA
+                                                 # directory as shown)
 graphql_server --redfish http://127.0.0.1:9000   # plain-http Redfish
 graphql_server --bus system                      # + live D-Bus sensors
-graphql_server --port 8443 --tls                 # self-signed cert on stdout
-graphql_server --tls --cert c.pem --key k.pem    # your own certificate
-curl -s localhost:8080/graphql -H 'Content-Type: application/json' \
+graphql_server --port 8443                       # HTTPS, self-signed cert on stdout
+graphql_server --cert c.pem --key k.pem          # your own certificate
+graphql_server --no-tls                          # plain HTTP
+curl -s --cacert cert.pem https://localhost:8080/graphql \
+     -H 'Content-Type: application/json' \
      -d '{"query":"{ sensors { Name Reading } }"}'
 ```
 

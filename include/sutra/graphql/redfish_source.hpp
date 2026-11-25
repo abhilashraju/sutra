@@ -49,10 +49,6 @@
 namespace sutra::graphql
 {
 
-// Name under which RedfishSource registers in the SourceRegistry and which
-// schema fields select with "source": "redfish".
-inline constexpr const char* redfishSourceName = "redfish";
-
 /**
  * @brief The one Redfish operation RedfishSource needs. Tests supply a fake.
  *
@@ -360,6 +356,53 @@ class RedfishSource : public DataSource
             }
         }
         co_return nlohmann::json{{"Members", std::move(result)}};
+    }
+
+    Task<Result<nlohmann::json>> fetchLink(const std::string& target) override
+    {
+        auto payload = co_await backend->get(target);
+        if (!payload)
+        {
+            co_return std::unexpected(payload.error());
+        }
+        if (payload->is_object() && payload->contains("Members") &&
+            (*payload)["Members"].is_array())
+        {
+            nlohmann::json& members = (*payload)["Members"];
+            std::vector<size_t> linkIndexes;
+            std::vector<Task<std::optional<nlohmann::json>>> fetches;
+            for (size_t i = 0; i < members.size(); ++i)
+            {
+                if (redfish_source_detail::isLinkOnly(members[i]))
+                {
+                    linkIndexes.push_back(i);
+                    fetches.push_back(redfish_source_detail::fetchMember(
+                        backend, members[i]["@odata.id"].get<std::string>()));
+                }
+            }
+            if (!fetches.empty())
+            {
+                auto fetched = co_await gather(
+                    std::move(fetches),
+                    redfish_source_detail::maxConcurrentMembers);
+                for (size_t i = 0; i < linkIndexes.size(); ++i)
+                {
+                    members[linkIndexes[i]] =
+                        fetched[i] ? std::move(*fetched[i])
+                                   : nlohmann::json(nullptr);
+                }
+            }
+            nlohmann::json result = nlohmann::json::array();
+            for (auto& member : members)
+            {
+                if (!member.is_null())
+                {
+                    result.push_back(std::move(member));
+                }
+            }
+            (*payload)["Members"] = std::move(result);
+        }
+        co_return std::move(*payload);
     }
 
   private:

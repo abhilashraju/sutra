@@ -679,15 +679,16 @@ class Executor : public std::enable_shared_from_this<Executor>
                     "Expected collection Members array for '" + fieldSpec.name +
                     "'");
             }
-            co_return projectList((*payload)["Members"], fieldSpec.returnType,
-                                  selection.selections);
+            co_return co_await projectList((*payload)["Members"],
+                                           fieldSpec.returnType,
+                                           selection.selections);
         }
         if (fieldSpec.scalar)
         {
             co_return std::move(*payload);
         }
-        co_return projectObject(*payload, fieldSpec.returnType,
-                                selection.selections);
+        co_return co_await projectObject(*payload, fieldSpec.returnType,
+                                         selection.selections);
     }
 
     Task<Result<nlohmann::json>> resolveSubscriptionField(
@@ -742,15 +743,16 @@ class Executor : public std::enable_shared_from_this<Executor>
                     "Expected collection Members array for '" +
                     fieldSpec->name + "'");
             }
-            co_return projectList((*payload)["Members"], fieldSpec->returnType,
-                                  selection.selections);
+            co_return co_await projectList((*payload)["Members"],
+                                           fieldSpec->returnType,
+                                           selection.selections);
         }
         if (fieldSpec->scalar)
         {
             co_return std::move(*payload);
         }
-        co_return projectObject(*payload, fieldSpec->returnType,
-                                selection.selections);
+        co_return co_await projectObject(*payload, fieldSpec->returnType,
+                                         selection.selections);
     }
 
     Task<Result<nlohmann::json>> executeSubscriptionSelections(
@@ -807,7 +809,7 @@ class Executor : public std::enable_shared_from_this<Executor>
             "No I/O executor available for subscription timer");
     }
 
-    Result<nlohmann::json> projectList(
+    Task<Result<nlohmann::json>> projectList(
         const nlohmann::json& items, const std::string& typeName,
         const std::vector<FieldSelection>& selections) const
     {
@@ -815,64 +817,126 @@ class Executor : public std::enable_shared_from_this<Executor>
         for (const auto& item : items)
         {
             Result<nlohmann::json> projected =
-                projectObject(item, typeName, selections);
+                co_await projectObject(item, typeName, selections);
             if (!projected)
             {
-                return projected;
+                co_return projected;
             }
             result.push_back(std::move(*projected));
         }
-        return result;
+        co_return result;
     }
 
-    Result<nlohmann::json> projectField(const FieldSelection& selection,
-                                        const FieldSpec& fieldSpec,
-                                        const nlohmann::json& source) const
+    Task<Result<nlohmann::json>> projectField(
+        const FieldSelection& selection, const FieldSpec& fieldSpec,
+        const nlohmann::json& source) const
     {
         auto it = source.find(fieldSpec.responseKey);
         if (it == source.end())
         {
-            return nlohmann::json(nullptr);
+            co_return nlohmann::json(nullptr);
         }
         const nlohmann::json& value = *it;
         if (fieldSpec.scalar)
         {
-            return value;
+            co_return value;
         }
         if (value.is_null())
         {
-            return value;
+            co_return value;
         }
         if (fieldSpec.isList)
         {
+            if (fieldSpec.collectionLink)
+            {
+                if (!value.is_object() || !value.contains("@odata.id") ||
+                    !value["@odata.id"].is_string())
+                {
+                    co_return std::unexpected(
+                        "Expected collection link object for field '" +
+                        selection.name + "'");
+                }
+                const std::string collUrl =
+                    value["@odata.id"].get<std::string>() +
+                    "?$expand=*($levels=1)";
+
+                std::shared_ptr<DataSource> sourcePtr =
+                    sources ? sources->get(fieldSpec.source) : nullptr;
+                if (!sourcePtr)
+                {
+                    sourcePtr = sources ? sources->get(redfishSourceName)
+                                        : nullptr;
+                }
+                if (!sourcePtr)
+                {
+                    co_return std::unexpected(
+                        "Data source required for collection link on field '" +
+                        selection.name + "' is not available");
+                }
+
+                Result<nlohmann::json> collResult =
+                    co_await sourcePtr->fetchLink(collUrl);
+                if (!collResult)
+                {
+                    co_return std::unexpected(collResult.error());
+                }
+                if (!collResult->is_object() ||
+                    !collResult->contains("Members") ||
+                    !(*collResult)["Members"].is_array())
+                {
+                    co_return std::unexpected(
+                        "Expected Members array in collection link for '" +
+                        selection.name + "'");
+                }
+
+                nlohmann::json result = nlohmann::json::array();
+                for (const auto& member : (*collResult)["Members"])
+                {
+                    Result<nlohmann::json> itemResult = co_await projectObject(
+                        member, fieldSpec.returnType, selection.selections);
+                    if (itemResult)
+                    {
+                        result.push_back(std::move(*itemResult));
+                    }
+                    else
+                    {
+                        logWarning(
+                            "Skipping collection link member (projection failed): {}",
+                            itemResult.error());
+                    }
+                }
+                co_return result;
+            }
+
             if (!value.is_array())
             {
-                return std::unexpected(
+                co_return std::unexpected(
                     "Expected array for field '" + selection.name + "'");
             }
-            return projectList(value, fieldSpec.returnType,
-                               selection.selections);
+            co_return co_await projectList(value, fieldSpec.returnType,
+                                           selection.selections);
         }
-        return projectObject(value, fieldSpec.returnType, selection.selections);
+        co_return co_await projectObject(value, fieldSpec.returnType,
+                                         selection.selections);
     }
 
-    Result<nlohmann::json> projectObject(
+    Task<Result<nlohmann::json>> projectObject(
         const nlohmann::json& source, const std::string& typeName,
         const std::vector<FieldSelection>& selections) const
     {
         const ObjectSpec* objectSpec = schema.getObject(typeName);
         if (objectSpec == nullptr)
         {
-            return std::unexpected("Unknown object type: " + typeName);
+            co_return std::unexpected("Unknown object type: " + typeName);
         }
         if (!source.is_object())
         {
-            return std::unexpected(
+            co_return std::unexpected(
                 "Expected object for type '" + typeName + "'");
         }
         if (selections.empty())
         {
-            return source;
+            co_return source;
         }
         nlohmann::json result = nlohmann::json::object();
         for (const FieldSelection& selection : selections)
@@ -880,18 +944,18 @@ class Executor : public std::enable_shared_from_this<Executor>
             auto fieldIt = objectSpec->fields.find(selection.name);
             if (fieldIt == objectSpec->fields.end())
             {
-                return std::unexpected("Unknown field '" + selection.name +
-                                       "' on type '" + typeName + "'");
+                co_return std::unexpected("Unknown field '" + selection.name +
+                                          "' on type '" + typeName + "'");
             }
             Result<nlohmann::json> field =
-                projectField(selection, fieldIt->second, source);
+                co_await projectField(selection, fieldIt->second, source);
             if (!field)
             {
-                return field;
+                co_return field;
             }
             result[outputName(selection)] = std::move(*field);
         }
-        return result;
+        co_return result;
     }
 
     Schema schema;

@@ -43,8 +43,10 @@ std::shared_ptr<FakeRedfish> makeFake()
          {{{"@odata.id", "/redfish/v1/Chassis/c1"}},
           {{"@odata.id", "/redfish/v1/Chassis/missing"}},
           {{"@odata.id", "/redfish/v1/Chassis/c2"}}}}};
-    fake->tree["/redfish/v1/Chassis/c1"] = {{"Id", "c1"},
-                                            {"Status", {{"Health", "OK"}}}};
+    fake->tree["/redfish/v1/Chassis/c1"] = {
+        {"Id", "c1"},
+        {"Status", {{"Health", "OK"}}},
+        {"Sensors", {{"@odata.id", "/redfish/v1/Chassis/c1/Sensors"}}}};
     fake->tree["/redfish/v1/Chassis/c2"] = {
         {"Id", "c2"}, {"Status", {{"Health", "Critical"}}}};
     fake->tree["/redfish/v1/Chassis/c1/Sensors?$expand=*($levels=1)"] = {
@@ -73,7 +75,9 @@ json schemaJson()
     {"name": "Chassis", "fields": [
       {"name": "Id", "responseKey": "Id", "returnType": "String",
        "scalar": true},
-      {"name": "Status", "responseKey": "Status", "returnType": "Status"}]},
+      {"name": "Status", "responseKey": "Status", "returnType": "Status"},
+      {"name": "sensors", "responseKey": "Sensors", "returnType": "Sensor",
+       "isList": true, "collectionLink": true}]},
     {"name": "Sensor", "fields": [
       {"name": "Id", "responseKey": "Id", "returnType": "String",
        "scalar": true},
@@ -163,6 +167,20 @@ TEST(GraphqlRedfish, ArgumentFillsPathAndNestedObjectIsProjected)
     EXPECT_EQ(r["data"]["chassis"]["Status"]["Health"], "Critical");
     ASSERT_EQ(fake->calls.size(), 1u);
     EXPECT_EQ(fake->calls[0], "/redfish/v1/Chassis/c2");
+}
+
+TEST(GraphqlRedfish, CollectionLinkTraversedAndProjected)
+{
+    auto fake = makeFake();
+    Executor executor = makeExecutor(fake);
+    json r =
+        run(executor, R"({ chassis(id: "c1") { Id sensors { Id Reading } } })");
+    ASSERT_TRUE(r.contains("data")) << r.dump();
+    EXPECT_EQ(r["data"]["chassis"]["Id"], "c1");
+    const auto& sensors = r["data"]["chassis"]["sensors"];
+    ASSERT_EQ(sensors.size(), 2u);
+    EXPECT_EQ(sensors[0]["Id"], "t");
+    EXPECT_EQ(sensors[1]["Id"], "f");
 }
 
 TEST(GraphqlRedfish, ArgumentCannotEscapeThePath)

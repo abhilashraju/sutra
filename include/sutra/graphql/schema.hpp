@@ -15,6 +15,7 @@ namespace sutra::graphql
 
 // Source used by root fields that do not name one explicitly.
 inline constexpr const char* defaultSourceName = "memory";
+inline constexpr const char* redfishSourceName = "redfish";
 
 struct ArgumentSpec
 {
@@ -33,6 +34,7 @@ struct FieldSpec
     std::string returnType;
     bool isList = false;
     bool scalar = false;
+    bool collectionLink = false;
     std::vector<ArgumentSpec> arguments;
     // Name of the data source that fills this root field.
     std::string source = defaultSourceName;
@@ -241,8 +243,32 @@ class Schema
         fs.returnType = f.value("returnType", std::string{});
         fs.isList = f.value("isList", false);
         fs.scalar = f.value("scalar", false);
+        fs.collectionLink = f.value("collectionLink", false);
         fs.source = f.value("source", std::string{defaultSourceName});
         fs.sourceConfig = f.value("sourceConfig", nlohmann::json());
+
+        if (f.contains("redfishPath"))
+        {
+            if (fs.source == defaultSourceName && !f.contains("source"))
+            {
+                fs.source = "redfish";
+            }
+            if (fs.sourceConfig.is_null() || fs.sourceConfig.empty())
+            {
+                fs.sourceConfig = nlohmann::json::object();
+                fs.sourceConfig["path"] = f["redfishPath"];
+                if (f.contains("expandMembers"))
+                {
+                    fs.sourceConfig["expandMembers"] = f["expandMembers"];
+                }
+            }
+        }
+        else if (f.contains("expandMembers") && fs.sourceConfig.is_object() &&
+                 !fs.sourceConfig.contains("expandMembers"))
+        {
+            fs.sourceConfig["expandMembers"] = f["expandMembers"];
+        }
+
         for (const auto& a : f.value("arguments", nlohmann::json::array()))
         {
             ArgumentSpec as;

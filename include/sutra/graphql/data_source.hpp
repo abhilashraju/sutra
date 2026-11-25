@@ -43,6 +43,17 @@ class DataSource
      */
     virtual Task<Result<nlohmann::json>> fetch(const FieldSpec& fieldSpec,
                                                const nlohmann::json& args) = 0;
+
+    /**
+     * @brief Resolves a link (e.g. for collectionLink traversal).
+     * @param target Absolute URL/path to fetch.
+     */
+    virtual Task<Result<nlohmann::json>> fetchLink(
+        const std::string& /*target*/)
+    {
+        co_return std::unexpected(
+            "Link traversal not supported by this data source");
+    }
 };
 
 /** @brief Name to DataSource lookup. */
@@ -187,6 +198,16 @@ class MemorySource : public DataSource
             }
         }
         co_return std::unexpected("'" + wanted + "' not found");
+    }
+
+    Task<Result<nlohmann::json>> fetchLink(const std::string& target) override
+    {
+        auto it = data.find(target);
+        if (it != data.end())
+        {
+            co_return it->second;
+        }
+        co_return std::unexpected("no data for link '" + target + "'");
     }
 
   private:

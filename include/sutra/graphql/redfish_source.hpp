@@ -63,6 +63,9 @@ class RedfishBackend
 
     /** @param target Absolute path plus optional query, e.g. `/redfish/v1`. */
     virtual Task<Result<nlohmann::json>> get(std::string target) = 0;
+
+    /** @brief Discard any cached responses. No-op by default. */
+    virtual void clearCache() {}
 };
 
 /** @brief Credentials sent with every request; at most one kind is used. */
@@ -272,9 +275,6 @@ inline Task<std::optional<nlohmann::json>> fetchMember(
 
 } // namespace redfish_source_detail
 
-// Forward declaration for use inside RedfishSource::clearCache().
-class CachingRedfishBackend;
-
 /** @brief DataSource that fills a root field from a Redfish service. */
 class RedfishSource : public DataSource
 {
@@ -285,10 +285,7 @@ class RedfishSource : public DataSource
 
     void clearCache() override
     {
-        if (auto* cb = dynamic_cast<CachingRedfishBackend*>(backend.get()))
-        {
-            cb->clearCache();
-        }
+        backend->clearCache();
     }
 
     Result<void> validate(const FieldSpec& fieldSpec) const override
@@ -567,7 +564,7 @@ class CachingRedfishBackend : public RedfishBackend
 
     /** @brief Discard all cached responses. Call before each subscription
      *         poll tick so each cycle sees fresh data. */
-    void clearCache()
+    void clearCache() override
     {
         cache.clear();
     }

@@ -17,11 +17,15 @@
 #include <errno.h>
 #include <systemd/sd-journal.h>
 
+#include <concepts>
 #include <cstdio>
 #include <format>
 #include <functional>
+#include <iterator>
+#include <source_location>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #ifndef SUTRA_LOG_LEVEL
 #define SUTRA_LOG_LEVEL 1
@@ -104,14 +108,43 @@ inline void setLogSink(LogSink sink)
     details::logSink() = std::move(sink);
 }
 
+/**
+ * @brief A format string that also captures the caller's source location.
+ *
+ * Implicitly constructible from a string literal, so call sites keep the
+ * `logWarning("fmt {}", x)` form while the file name and line of that call are
+ * recorded automatically.
+ */
 template <class... Args>
-void log(LogLevel level, std::format_string<Args...> fmt, Args&&... args)
+struct LogFormat
+{
+    std::format_string<Args...> fmt;
+    std::source_location loc;
+
+    template <class T>
+        requires std::convertible_to<const T&, std::string_view>
+    consteval LogFormat(
+        const T& s, std::source_location l = std::source_location::current()) :
+        fmt(s), loc(l)
+    {}
+};
+
+template <class... Args>
+void log(LogLevel level, LogFormat<std::type_identity_t<Args>...> fmt,
+         Args&&... args)
 {
     if (static_cast<int>(level) < SUTRA_LOG_LEVEL)
     {
         return;
     }
-    std::string message = std::format(fmt, std::forward<Args>(args)...);
+    std::string_view file = fmt.loc.file_name();
+    if (auto slash = file.find_last_of('/'); slash != std::string_view::npos)
+    {
+        file.remove_prefix(slash + 1);
+    }
+    std::string message = std::format("{}:{}: ", file, fmt.loc.line());
+    std::format_to(std::back_inserter(message), fmt.fmt,
+                   std::forward<Args>(args)...);
     if (auto& sink = details::logSink(); sink)
     {
         sink(level, message);
@@ -121,25 +154,25 @@ void log(LogLevel level, std::format_string<Args...> fmt, Args&&... args)
 }
 
 template <class... Args>
-void logDebug(std::format_string<Args...> fmt, Args&&... args)
+void logDebug(LogFormat<std::type_identity_t<Args>...> fmt, Args&&... args)
 {
     log(LogLevel::debug, fmt, std::forward<Args>(args)...);
 }
 
 template <class... Args>
-void logInfo(std::format_string<Args...> fmt, Args&&... args)
+void logInfo(LogFormat<std::type_identity_t<Args>...> fmt, Args&&... args)
 {
     log(LogLevel::info, fmt, std::forward<Args>(args)...);
 }
 
 template <class... Args>
-void logWarning(std::format_string<Args...> fmt, Args&&... args)
+void logWarning(LogFormat<std::type_identity_t<Args>...> fmt, Args&&... args)
 {
     log(LogLevel::warning, fmt, std::forward<Args>(args)...);
 }
 
 template <class... Args>
-void logError(std::format_string<Args...> fmt, Args&&... args)
+void logError(LogFormat<std::type_identity_t<Args>...> fmt, Args&&... args)
 {
     log(LogLevel::error, fmt, std::forward<Args>(args)...);
 }

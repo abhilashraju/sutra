@@ -285,9 +285,7 @@ std::shared_ptr<sdbusplus::asio::connection> addDbusSource(
     }
     try
     {
-        auto bus = std::make_shared<sdbusplus::asio::connection>(
-            ioc, options.bus == "session" ? sdbusplus::bus::new_user()
-                                          : sdbusplus::bus::new_system());
+        auto bus = makeConnection(ioc, options.bus == "session");
         registry.add(graphql::dbusSourceName,
                      std::make_shared<graphql::DbusSource>(
                          std::make_shared<graphql::SutraDbusBackend>(bus)));

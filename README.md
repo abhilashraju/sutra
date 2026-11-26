@@ -196,7 +196,8 @@ co_await web.withUrl(".../events").executeAsStream(
 ### D-Bus (`dbus.hpp`, needs `SUTRA_HAVE_DBUS`)
 
 ```cpp
-sdbusplus::asio::connection bus(ioc, sdbusplus::bus::new_system());
+auto conn = makeConnection(ioc, /*session=*/false); // works with older sdbusplus too
+auto& bus = *conn;
 auto state = co_await getProperty<std::string>(
     bus, "xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0",
     "xyz.openbmc_project.State.Host", "CurrentHostState");

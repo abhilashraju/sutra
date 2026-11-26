@@ -21,8 +21,7 @@ constexpr auto testInterface = "com.sutra.Test";
 std::shared_ptr<sdbusplus::asio::connection> connect(net::io_context& ioc,
                                                      const char* name)
 {
-    auto conn = std::make_shared<sdbusplus::asio::connection>(
-        ioc, sdbusplus::bus::new_user());
+    auto conn = makeConnection(ioc, true);
     conn->request_name(name);
     return conn;
 }
@@ -127,7 +126,8 @@ void runWithBus(Body body)
     net::io_context ioc;
     TestService service(ioc);
     MapperStub mapper(ioc);
-    sdbusplus::asio::connection client(ioc, sdbusplus::bus::new_user());
+    auto clientPtr = makeConnection(ioc, true);
+    auto& client = *clientPtr;
 
     exec::async_scope scope;
     bool failed = false;

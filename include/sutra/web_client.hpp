@@ -545,8 +545,10 @@ class WebClientT
             {
                 break;
             }
+            // target() returns a boost string_view, which std::format cannot
+            // format with every Boost version; convert it explicitly.
             logDebug("retry {}/{} for {}:{} {}", attemptNo, policy.maxTries,
-                     host, port, req.target());
+                     host, port, std::string_view(req.target()));
             net::steady_timer sleeper(pool->getExecutor());
             sleeper.expires_after(backoff);
             co_await sleeper.async_wait(useSender);

@@ -29,12 +29,15 @@
 
 #include "sutra/config.hpp"
 
+#include <systemd/sd-bus.h>
+
 #include <sdbusplus/asio/connection.hpp>
 #include <sdbusplus/asio/object_server.hpp>
 #include <sdbusplus/message.hpp>
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -57,6 +60,24 @@ constexpr auto dbusIntrospectableInterface =
 constexpr auto associationInterface = "xyz.openbmc_project.Association";
 
 using ObjectPath = sdbusplus::object_path;
+
+/**
+ * @brief Opens the session or system bus and wraps it in an asio connection.
+ *
+ * Kept for backward compatibility with older sdbusplus versions, whose
+ * `asio::connection` has no constructor taking a `bus_t`. The
+ * `(io_context&, sd_bus*)` constructor exists in every version. The
+ * connection takes its own reference, so the local one is dropped on return.
+ */
+inline std::shared_ptr<sdbusplus::asio::connection> makeConnection(
+    net::io_context& ioc, bool session)
+{
+    auto bus = session ? sdbusplus::bus::new_user()
+                       : sdbusplus::bus::new_system();
+    std::unique_ptr<sd_bus, decltype(&sd_bus_unref)> raw(bus.release(),
+                                                         &sd_bus_unref);
+    return std::make_shared<sdbusplus::asio::connection>(ioc, raw.get());
+}
 
 /**
  * @brief Any value a D-Bus property commonly carries.

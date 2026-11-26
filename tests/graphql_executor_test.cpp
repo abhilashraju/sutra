@@ -187,7 +187,8 @@ TEST(GraphqlExecutor, ThrowingSourceBecomesError)
             return {};
         }
 
-        Task<Result<json>> fetch(const FieldSpec&, const json&) override
+        Task<Result<json>> fetch(const FieldSpec&, const json&,
+                                 RequestCache&) override
         {
             throw std::runtime_error("boom");
             co_return json();
@@ -218,7 +219,8 @@ class SlowSource : public DataSource
         return {};
     }
 
-    Task<Result<json>> fetch(const FieldSpec&, const json&) override
+    Task<Result<json>> fetch(const FieldSpec&, const json&,
+                             RequestCache&) override
     {
         const int index = started++;
         ++running;

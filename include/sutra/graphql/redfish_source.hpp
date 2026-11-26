@@ -63,9 +63,6 @@ class RedfishBackend
 
     /** @param target Absolute path plus optional query, e.g. `/redfish/v1`. */
     virtual Task<Result<nlohmann::json>> get(std::string target) = 0;
-
-    /** @brief Discard any cached responses. No-op by default. */
-    virtual void clearCache() {}
 };
 
 /** @brief Credentials sent with every request; at most one kind is used. */
@@ -259,12 +256,37 @@ inline bool isLinkOnly(const nlohmann::json& member)
            member.contains("@odata.id") && member["@odata.id"].is_string();
 }
 
+/**
+ * @brief GET through the request cache: a URL already fetched during this
+ *        request is answered from `cache`; only successes are cached.
+ *
+ * A free coroutine: all arguments live in its frame (a lambda coroutine's
+ * closure could be destroyed before the frame uses it).
+ */
+inline Task<Result<nlohmann::json>> cachedGet(
+    std::shared_ptr<RedfishBackend> backend, RequestCache& cache,
+    std::string target)
+{
+    const std::string key = "redfish:" + target;
+    if (auto it = cache.responses.find(key); it != cache.responses.end())
+    {
+        co_return it->second;
+    }
+    auto result = co_await backend->get(target);
+    if (result)
+    {
+        cache.responses.emplace(key, *result);
+    }
+    co_return result;
+}
+
 // A free coroutine: all arguments live in its frame (a lambda coroutine's
 // closure could be destroyed before the frame uses it).
 inline Task<std::optional<nlohmann::json>> fetchMember(
-    std::shared_ptr<RedfishBackend> backend, std::string target)
+    std::shared_ptr<RedfishBackend> backend, RequestCache& cache,
+    std::string target)
 {
-    auto result = co_await backend->get(target);
+    auto result = co_await cachedGet(std::move(backend), cache, target);
     if (!result)
     {
         logWarning("redfish: skipping member '{}': {}", target, result.error());
@@ -283,11 +305,6 @@ class RedfishSource : public DataSource
         backend(std::move(redfishBackend))
     {}
 
-    void clearCache() override
-    {
-        backend->clearCache();
-    }
-
     Result<void> validate(const FieldSpec& fieldSpec) const override
     {
         auto config = redfish_source_detail::parseConfig(fieldSpec);
@@ -299,7 +316,8 @@ class RedfishSource : public DataSource
     }
 
     Task<Result<nlohmann::json>> fetch(const FieldSpec& fieldSpec,
-                                       const nlohmann::json& args) override
+                                       const nlohmann::json& args,
+                                       RequestCache& cache) override
     {
         auto config = redfish_source_detail::parseConfig(fieldSpec);
         if (!config)
@@ -317,7 +335,8 @@ class RedfishSource : public DataSource
             *target += "$expand=*($levels=1)";
         }
 
-        auto payload = co_await backend->get(*target);
+        auto payload =
+            co_await redfish_source_detail::cachedGet(backend, cache, *target);
         if (!payload)
         {
             co_return std::unexpected(payload.error());
@@ -345,7 +364,8 @@ class RedfishSource : public DataSource
             {
                 linkIndexes.push_back(i);
                 fetches.push_back(redfish_source_detail::fetchMember(
-                    backend, members[i]["@odata.id"].get<std::string>()));
+                    backend, cache,
+                    members[i]["@odata.id"].get<std::string>()));
             }
         }
         auto fetched = co_await gather(
@@ -368,9 +388,11 @@ class RedfishSource : public DataSource
         co_return nlohmann::json{{"Members", std::move(result)}};
     }
 
-    Task<Result<nlohmann::json>> fetchLink(const std::string& target) override
+    Task<Result<nlohmann::json>> fetchLink(const std::string& target,
+                                           RequestCache& cache) override
     {
-        auto payload = co_await backend->get(target);
+        auto payload =
+            co_await redfish_source_detail::cachedGet(backend, cache, target);
         if (!payload)
         {
             co_return std::unexpected(payload.error());
@@ -387,7 +409,8 @@ class RedfishSource : public DataSource
                 {
                     linkIndexes.push_back(i);
                     fetches.push_back(redfish_source_detail::fetchMember(
-                        backend, members[i]["@odata.id"].get<std::string>()));
+                        backend, cache,
+                        members[i]["@odata.id"].get<std::string>()));
                 }
             }
             if (!fetches.empty())
@@ -510,73 +533,5 @@ using RedfishHttpBackend = RedfishWebBackend<tcp::socket>;
 
 /** @brief HTTPS Redfish backend (certificates are always verified). */
 using RedfishHttpsBackend = RedfishWebBackend<ssl::stream<tcp::socket>>;
-
-/**
- * @brief Wraps any RedfishBackend with a per-request-cycle response cache.
- *
- * During a single query or subscription poll cycle all GET requests issued for
- * the same URL return the same cached JSON body without hitting the network
- * again.  The cache is cleared by calling `clearCache()` before each new cycle
- * — the executor calls this automatically through
- * `RedfishSource::clearCache()`.
- *
- * `fetchFresh(target)` unconditionally bypasses the cache (used by subscription
- * loops that want live data every tick).
- *
- * Usage:
- * @code
- * auto rawBackend = std::make_shared<RedfishHttpsBackend>(...);
- * auto cachedBackend = std::make_shared<CachingRedfishBackend>(rawBackend);
- * auto source = std::make_shared<RedfishSource>(cachedBackend);
- * // Before each subscription tick:
- * source->clearCache();
- * @endcode
- */
-class CachingRedfishBackend : public RedfishBackend
-{
-  public:
-    explicit CachingRedfishBackend(std::shared_ptr<RedfishBackend> inner) :
-        inner(std::move(inner))
-    {}
-
-    /** @brief GET with caching: returns a cached copy if the URL was already
-     *         fetched since the last clearCache(). */
-    Task<Result<nlohmann::json>> get(std::string target) override
-    {
-        auto it = cache.find(target);
-        if (it != cache.end())
-        {
-            co_return it->second;
-        }
-        auto result = co_await inner->get(target);
-        if (result)
-        {
-            cache.emplace(target, *result);
-        }
-        co_return result;
-    }
-
-    /** @brief GET bypassing the cache (always fetches live data). */
-    Task<Result<nlohmann::json>> getFresh(const std::string& target)
-    {
-        return inner->get(target);
-    }
-
-    /** @brief Discard all cached responses. Call before each subscription
-     *         poll tick so each cycle sees fresh data. */
-    void clearCache() override
-    {
-        cache.clear();
-    }
-
-    std::size_t cacheSize() const
-    {
-        return cache.size();
-    }
-
-  private:
-    std::shared_ptr<RedfishBackend> inner;
-    std::unordered_map<std::string, nlohmann::json> cache;
-};
 
 } // namespace sutra::graphql

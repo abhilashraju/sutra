@@ -221,7 +221,6 @@ class Executor : public std::enable_shared_from_this<Executor>
     Task<nlohmann::json> execute(
         std::string query, nlohmann::json variables = nlohmann::json::object())
     {
-        clearAllSourceCaches();
         Result<Operation> parsed = Parser::tryParse(query);
         if (!parsed)
         {
@@ -253,11 +252,14 @@ class Executor : public std::enable_shared_from_this<Executor>
         // Query root fields are independent, so resolve them concurrently
         // (bounded). Results keep the query order; the first failing field in
         // that order decides the error, exactly as in sequential execution.
+        // The cache lives for this request only, so concurrent requests never
+        // see each other's entries.
+        RequestCache cache;
         std::vector<Task<Result<nlohmann::json>>> pending;
         pending.reserve(operation.selections.size());
         for (const FieldSelection& selection : operation.selections)
         {
-            pending.push_back(resolveRootField(selection, merged));
+            pending.push_back(resolveRootField(selection, merged, cache));
         }
         auto fields = co_await gather(std::move(pending), maxConcurrentFields);
 
@@ -306,24 +308,6 @@ class Executor : public std::enable_shared_from_this<Executor>
     const std::vector<DbusWatcher>& getDbusWatchers() const
     {
         return schema.getDbusWatchers();
-    }
-
-    /** @brief Clear the response cache on every registered data source.
-     *
-     * Automatically called at the start of each `execute()` and before each
-     * subscription poll tick (after the trigger fires). Sources that do not
-     * cache anything treat this as a no-op.
-     */
-    void clearAllSourceCaches()
-    {
-        if (!sources)
-        {
-            return;
-        }
-        for (const auto& [name, src] : sources->all())
-        {
-            src->clearCache();
-        }
     }
 
     // Called by D-Bus property watcher or external event injection with the
@@ -438,9 +422,12 @@ class Executor : public std::enable_shared_from_this<Executor>
 
         while (session->active && !session->subscribers.empty())
         {
+            // A fresh cache per tick: every tick sees live data, and it is
+            // never shared with other requests.
+            RequestCache cache;
             Result<nlohmann::json> tickResult =
                 co_await executeSubscriptionSelections(
-                    session->operation.selections, mergedVariables);
+                    session->operation.selections, mergedVariables, cache);
 
             nlohmann::json event;
             if (!tickResult)
@@ -490,7 +477,6 @@ class Executor : public std::enable_shared_from_this<Executor>
             {
                 break;
             }
-            clearAllSourceCaches();
         }
 
         activeSubscriptions.erase(session->key);
@@ -654,7 +640,8 @@ class Executor : public std::enable_shared_from_this<Executor>
     }
 
     Task<Result<nlohmann::json>> resolveRootField(
-        const FieldSelection& selection, const nlohmann::json& variables)
+        const FieldSelection& selection, const nlohmann::json& variables,
+        RequestCache& cache)
     {
         // validateOperation() already proved the field exists.
         const FieldSpec& fieldSpec = *schema.getRootQueryField(selection.name);
@@ -674,7 +661,7 @@ class Executor : public std::enable_shared_from_this<Executor>
             std::unexpected(std::string("source did not run"));
         try
         {
-            payload = co_await source->fetch(fieldSpec, args);
+            payload = co_await source->fetch(fieldSpec, args, cache);
         }
         catch (const std::exception& e)
         {
@@ -701,18 +688,19 @@ class Executor : public std::enable_shared_from_this<Executor>
             }
             co_return co_await projectList((*payload)["Members"],
                                            fieldSpec.returnType,
-                                           selection.selections);
+                                           selection.selections, cache);
         }
         if (fieldSpec.scalar)
         {
             co_return std::move(*payload);
         }
         co_return co_await projectObject(*payload, fieldSpec.returnType,
-                                         selection.selections);
+                                         selection.selections, cache);
     }
 
     Task<Result<nlohmann::json>> resolveSubscriptionField(
-        const FieldSelection& selection, const nlohmann::json& variables)
+        const FieldSelection& selection, const nlohmann::json& variables,
+        RequestCache& cache)
     {
         const FieldSpec* fieldSpec =
             schema.getRootSubscriptionField(selection.name);
@@ -737,7 +725,7 @@ class Executor : public std::enable_shared_from_this<Executor>
             std::unexpected(std::string("source did not run"));
         try
         {
-            payload = co_await source->fetch(*fieldSpec, args);
+            payload = co_await source->fetch(*fieldSpec, args, cache);
         }
         catch (const std::exception& e)
         {
@@ -765,25 +753,26 @@ class Executor : public std::enable_shared_from_this<Executor>
             }
             co_return co_await projectList((*payload)["Members"],
                                            fieldSpec->returnType,
-                                           selection.selections);
+                                           selection.selections, cache);
         }
         if (fieldSpec->scalar)
         {
             co_return std::move(*payload);
         }
         co_return co_await projectObject(*payload, fieldSpec->returnType,
-                                         selection.selections);
+                                         selection.selections, cache);
     }
 
     Task<Result<nlohmann::json>> executeSubscriptionSelections(
         const std::vector<FieldSelection>& selections,
-        const nlohmann::json& variables)
+        const nlohmann::json& variables, RequestCache& cache)
     {
         std::vector<Task<Result<nlohmann::json>>> pending;
         pending.reserve(selections.size());
         for (const FieldSelection& selection : selections)
         {
-            pending.push_back(resolveSubscriptionField(selection, variables));
+            pending.push_back(
+                resolveSubscriptionField(selection, variables, cache));
         }
         auto fields = co_await gather(std::move(pending), maxConcurrentFields);
 
@@ -831,13 +820,14 @@ class Executor : public std::enable_shared_from_this<Executor>
 
     Task<Result<nlohmann::json>> projectList(
         const nlohmann::json& items, const std::string& typeName,
-        const std::vector<FieldSelection>& selections) const
+        const std::vector<FieldSelection>& selections,
+        RequestCache& cache) const
     {
         nlohmann::json result = nlohmann::json::array();
         for (const auto& item : items)
         {
             Result<nlohmann::json> projected =
-                co_await projectObject(item, typeName, selections);
+                co_await projectObject(item, typeName, selections, cache);
             if (!projected)
             {
                 co_return projected;
@@ -849,7 +839,7 @@ class Executor : public std::enable_shared_from_this<Executor>
 
     Task<Result<nlohmann::json>> projectField(
         const FieldSelection& selection, const FieldSpec& fieldSpec,
-        const nlohmann::json& source) const
+        const nlohmann::json& source, RequestCache& cache) const
     {
         auto it = source.find(fieldSpec.responseKey);
         if (it == source.end())
@@ -895,7 +885,7 @@ class Executor : public std::enable_shared_from_this<Executor>
                 }
 
                 Result<nlohmann::json> collResult =
-                    co_await sourcePtr->fetchLink(collUrl);
+                    co_await sourcePtr->fetchLink(collUrl, cache);
                 if (!collResult)
                 {
                     co_return std::unexpected(collResult.error());
@@ -912,8 +902,9 @@ class Executor : public std::enable_shared_from_this<Executor>
                 nlohmann::json result = nlohmann::json::array();
                 for (const auto& member : (*collResult)["Members"])
                 {
-                    Result<nlohmann::json> itemResult = co_await projectObject(
-                        member, fieldSpec.returnType, selection.selections);
+                    Result<nlohmann::json> itemResult =
+                        co_await projectObject(member, fieldSpec.returnType,
+                                               selection.selections, cache);
                     if (itemResult)
                     {
                         result.push_back(std::move(*itemResult));
@@ -934,15 +925,16 @@ class Executor : public std::enable_shared_from_this<Executor>
                     "Expected array for field '" + selection.name + "'");
             }
             co_return co_await projectList(value, fieldSpec.returnType,
-                                           selection.selections);
+                                           selection.selections, cache);
         }
         co_return co_await projectObject(value, fieldSpec.returnType,
-                                         selection.selections);
+                                         selection.selections, cache);
     }
 
     Task<Result<nlohmann::json>> projectObject(
         const nlohmann::json& source, const std::string& typeName,
-        const std::vector<FieldSelection>& selections) const
+        const std::vector<FieldSelection>& selections,
+        RequestCache& cache) const
     {
         const ObjectSpec* objectSpec = schema.getObject(typeName);
         if (objectSpec == nullptr)
@@ -967,8 +959,8 @@ class Executor : public std::enable_shared_from_this<Executor>
                 co_return std::unexpected("Unknown field '" + selection.name +
                                           "' on type '" + typeName + "'");
             }
-            Result<nlohmann::json> field =
-                co_await projectField(selection, fieldIt->second, source);
+            Result<nlohmann::json> field = co_await projectField(
+                selection, fieldIt->second, source, cache);
             if (!field)
             {
                 co_return field;

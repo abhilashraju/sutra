@@ -16,6 +16,20 @@ namespace sutra::graphql
 {
 
 /**
+ * @brief Response cache scoped to ONE query execution or ONE subscription tick.
+ *
+ * The executor creates a fresh instance per request and hands it to every
+ * `DataSource` call made on that request's behalf, so concurrent requests
+ * never share or invalidate each other's entries and nothing needs clearing.
+ * Sources use it to avoid fetching the same resource twice within a request.
+ * Keys are chosen by the source; prefix them with the source name.
+ */
+struct RequestCache
+{
+    std::unordered_map<std::string, nlohmann::json> responses;
+};
+
+/**
  * @brief A pluggable back end that fills a root query field.
  *
  * The executor looks the field's `FieldSpec::source` up in a
@@ -38,31 +52,26 @@ class DataSource
     /**
      * @brief Resolves one root field.
      * @param args Resolved query arguments (schema defaults applied).
+     * @param cache Cache of the current request; may be ignored.
      *
-     * `fieldSpec` and `args` are owned by the caller and outlive the task.
+     * `fieldSpec`, `args` and `cache` are owned by the caller and outlive the
+     * task.
      */
     virtual Task<Result<nlohmann::json>> fetch(const FieldSpec& fieldSpec,
-                                               const nlohmann::json& args) = 0;
+                                               const nlohmann::json& args,
+                                               RequestCache& cache) = 0;
 
     /**
      * @brief Resolves a link (e.g. for collectionLink traversal).
      * @param target Absolute URL/path to fetch.
+     * @param cache Cache of the current request; may be ignored.
      */
     virtual Task<Result<nlohmann::json>> fetchLink(
-        const std::string& /*target*/)
+        const std::string& /*target*/, RequestCache& /*cache*/)
     {
         co_return std::unexpected(
             "Link traversal not supported by this data source");
     }
-
-    /**
-     * @brief Discard any per-request cached state.
-     *
-     * Called by the Executor at the start of each query execution and before
-     * each subscription poll tick. The default implementation is a no-op.
-     * Sources that cache responses (e.g. CachingRedfishBackend) override this.
-     */
-    virtual void clearCache() {}
 };
 
 /** @brief Name to DataSource lookup. */
@@ -83,13 +92,6 @@ class SourceRegistry
     bool has(const std::string& name) const
     {
         return sources.contains(name);
-    }
-
-    /** @brief Iterate all registered sources (name → source). */
-    const std::unordered_map<std::string, std::shared_ptr<DataSource>>& all()
-        const
-    {
-        return sources;
     }
 
   private:
@@ -172,7 +174,8 @@ class MemorySource : public DataSource
     }
 
     Task<Result<nlohmann::json>> fetch(const FieldSpec& fieldSpec,
-                                       const nlohmann::json& args) override
+                                       const nlohmann::json& args,
+                                       RequestCache&) override
     {
         auto it = data.find(fieldSpec.name);
         if (it == data.end())
@@ -216,7 +219,8 @@ class MemorySource : public DataSource
         co_return std::unexpected("'" + wanted + "' not found");
     }
 
-    Task<Result<nlohmann::json>> fetchLink(const std::string& target) override
+    Task<Result<nlohmann::json>> fetchLink(const std::string& target,
+                                           RequestCache&) override
     {
         auto it = data.find(target);
         if (it != data.end())

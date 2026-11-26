@@ -574,7 +574,8 @@ class DbusSource : public DataSource
     }
 
     Task<Result<nlohmann::json>> fetch(const FieldSpec& fieldSpec,
-                                       const nlohmann::json& args) override
+                                       const nlohmann::json& args,
+                                       RequestCache&) override
     {
         auto parsed =
             parseDbusSourceConfig(fieldSpec.sourceConfig, fieldSpec.isList);

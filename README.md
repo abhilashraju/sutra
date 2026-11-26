@@ -216,7 +216,11 @@ Same shape as the coroserver helpers: `dbusMethodCall<Ret...>`,
 * `Schema` is JSON driven (`objects[]`, `queries[]`; see
   `examples/graphql_server/schema.json`). Each root query names a `source`
   and an optional `sourceConfig`.
-* `DataSource::fetch(FieldSpec, args) -> Task<Result<json>>`; register
+* `DataSource::fetch(FieldSpec, args, RequestCache&) -> Task<Result<json>>`;
+  the executor creates one `RequestCache` per query execution and per
+  subscription tick, so identical requests (e.g. the same Redfish URL) are
+  fetched once per request, concurrent requests never share or invalidate each
+  other's entries, and subscription ticks always see live data. Register
   sources in a `SourceRegistry`; `applySourceRegistry` drops (or rejects)
   fields whose source is missing and validates the rest at start-up.
   Built in: `MemorySource` and, with D-Bus, `DbusSource` (declarative
@@ -311,11 +315,9 @@ ObjectMapper) reproduce the sessions used to test it.
 
 * Handlers and resolvers are `Task<>` (stdexec) instead of
   `boost::asio::awaitable`.
-* GraphQL: queries only (no mutations or subscriptions), no introspection, no
-  `@skip/@include` evaluation, no `__typename`. The D-Bus
-  signal-watcher subscriptions of the coroserver example were not ported, and
-  the Redfish source has no `collectionLink` (a nested `@odata.id`
-  sub-collection inside a resource) or response cache.
+* GraphQL: no mutations, no introspection, no `@skip/@include` evaluation, no
+  `__typename`. The per-request cache does not deduplicate identical GETs that
+  are in flight at the same moment, only ones that already completed.
 * Root fields, the objects of a D-Bus query and the interfaces of each object
   are resolved concurrently through `gather()` (at most 8 in flight per level;
   `Executor::setMaxConcurrentFields()` changes the root-field limit). Results

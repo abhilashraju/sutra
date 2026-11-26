@@ -177,10 +177,23 @@ inline ssl::context makeClientContext(const std::string& trustedPem = {})
  * @param caPath OpenSSL "CApath": a directory of PEM certificates, each
  *               reachable through its subject hash (`<hash>.0`, as created by
  *               `openssl rehash`). Nothing else is trusted.
- * @throws std::runtime_error when `caPath` is not a directory.
+ * @param clientCertPath optional PEM client certificate chain presented to the
+ *               server for mutual TLS. Must be given together with
+ *               `clientKeyPath`.
+ * @param clientKeyPath optional PEM private key for `clientCertPath`.
+ * @throws std::runtime_error when `caPath` is not a directory, only one of the
+ *         client cert/key is given, or the client cert/key cannot be loaded or
+ *         do not match.
  */
-inline ssl::context makeClientContextWithCaPath(const std::string& caPath)
+inline ssl::context makeClientContextWithCaPath(
+    const std::string& caPath, const std::string& clientCertPath = {},
+    const std::string& clientKeyPath = {})
 {
+    if (clientCertPath.empty() != clientKeyPath.empty())
+    {
+        throw std::runtime_error(
+            "client certificate and key must be given together");
+    }
     if (!std::filesystem::is_directory(caPath))
     {
         throw std::runtime_error("CA path '" + caPath + "' is not a directory");
@@ -192,6 +205,19 @@ inline ssl::context makeClientContextWithCaPath(const std::string& caPath)
     SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION);
     ctx.set_verify_mode(ssl::verify_peer);
     ctx.add_verify_path(caPath);
+    if (!clientCertPath.empty())
+    {
+        try
+        {
+            ctx.use_certificate_chain_file(clientCertPath);
+            ctx.use_private_key_file(clientKeyPath, ssl::context::pem);
+        }
+        catch (const std::exception& e)
+        {
+            throw std::runtime_error(
+                "client certificate/key: " + std::string(e.what()));
+        }
+    }
     return ctx;
 }
 

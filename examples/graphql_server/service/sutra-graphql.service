@@ -9,7 +9,9 @@ Type=simple
 # source on https://127.0.0.1:443 (user "service") verified against the CA
 # directory /etc/ssl/certs/authority. bmcweb's certificate is issued to
 # CN=bmc.peer (no SAN), so --redfish-server-name makes the client verify that
-# name while still connecting to 127.0.0.1. D-Bus source on the system bus.
+# name while still connecting to 127.0.0.1. The client certificate and key are
+# presented to the Redfish service for mutual TLS. D-Bus source on the system
+# bus.
 ExecStart=/usr/bin/graphql_server \
     --address 127.0.0.1 --port 18081 \
     --redfish https://127.0.0.1:443 \
@@ -19,6 +21,8 @@ ExecStart=/usr/bin/graphql_server \
     --key /etc/ssl/private/server_pkey.pem \
     --redfish-ca /etc/ssl/certs/authority \
     --redfish-server-name bmc.peer \
+    --redfish-client-cert /etc/ssl/certs/https/client_cert.pem \
+    --redfish-client-key /etc/ssl/private/client_pkey.pem \
     --bus system
 # Holds the secret, never put it on the command line:
 #   SUTRA_REDFISH_PASSWORD=...

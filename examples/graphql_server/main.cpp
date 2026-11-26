@@ -9,6 +9,7 @@
  *   graphql_server [--address 127.0.0.1] [--port 8080] [--schema FILE]
  *                  [--redfish URL] [--redfish-user NAME] [--redfish-ca DIR]
  *                  [--redfish-server-name NAME]
+ *                  [--redfish-client-cert FILE --redfish-client-key FILE]
  *                  [--bus session|system|none] [--no-tls]
  *                  [--cert FILE --key FILE]   (--help lists the short forms)
  *
@@ -21,7 +22,9 @@
  * service is verified against the CA directory --redfish-ca (default
  * /etc/ssl/certs/authority), and its certificate must carry the host in the
  * URL, or --redfish-server-name when the certificate names a different host
- * than the address used. The server refuses wildcard addresses.
+ * than the address used. When the Redfish service requires mutual TLS, give
+ * --redfish-client-cert and --redfish-client-key (PEM) to present a client
+ * certificate. The server refuses wildcard addresses.
  */
 #include "sutra/cert_generator.hpp"
 #include "sutra/command_line.hpp"
@@ -71,6 +74,8 @@ struct Options
     std::string redfishUser;
     std::string redfishCa = "/etc/ssl/certs/authority";
     std::string redfishServerName;
+    std::string redfishClientCert;
+    std::string redfishClientKey;
 };
 
 CommandLine makeCommandLine()
@@ -92,6 +97,11 @@ CommandLine makeCommandLine()
     cmd.addOption("--redfish-server-name", "NAME",
                   "name the Redfish certificate must carry (SNI and "
                   "verification), when it differs from the --redfish host");
+    cmd.addOption("--redfish-client-cert", "FILE",
+                  "client certificate (PEM) presented to an https Redfish "
+                  "service for mutual TLS (needs --redfish-client-key)");
+    cmd.addOption("--redfish-client-key", "FILE",
+                  "private key (PEM) for --redfish-client-cert");
     cmd.addOption("--bus,-b", "session|system|none",
                   "also read D-Bus fields from this bus (default none)");
     cmd.addFlag("--no-tls", "serve plain HTTP instead of HTTPS");
@@ -115,6 +125,11 @@ std::optional<std::string> validateOptions(const Options& options)
     if (options.certPath.empty() != options.keyPath.empty())
     {
         return "--cert and --key must be given together";
+    }
+    if (options.redfishClientCert.empty() != options.redfishClientKey.empty())
+    {
+        return "--redfish-client-cert and --redfish-client-key must be given "
+               "together";
     }
     if (options.tls && options.certPath.empty())
     {
@@ -141,6 +156,8 @@ std::expected<Options, std::string> readOptions(const CommandLine& cmd)
     options.redfishUser = cmd.valueOr("--redfish-user", "");
     options.redfishCa = cmd.valueOr("--redfish-ca", options.redfishCa);
     options.redfishServerName = cmd.valueOr("--redfish-server-name", "");
+    options.redfishClientCert = cmd.valueOr("--redfish-client-cert", "");
+    options.redfishClientKey = cmd.valueOr("--redfish-client-key", "");
 
     auto port = cmd.number<uint16_t>("--port");
     if (!port)
@@ -223,8 +240,9 @@ std::shared_ptr<graphql::RedfishBackend> makeHttpsRedfishBackend(
     net::io_context& ioc, const Options& options,
     const graphql::RedfishCredentials& credentials)
 {
-    auto context = std::make_shared<ssl::context>(
-        makeClientContextWithCaPath(options.redfishCa));
+    auto context = std::make_shared<ssl::context>(makeClientContextWithCaPath(
+        options.redfishCa, options.redfishClientCert,
+        options.redfishClientKey));
     ConnectionPoolConfig poolConfig;
     poolConfig.tlsServerName = options.redfishServerName;
     auto pool = HttpsConnectionPool::create(ioc.get_executor(), context.get(),

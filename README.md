@@ -266,6 +266,9 @@ graphql_server --redfish https://bmc:443 --redfish-ca /etc/ssl/certs/authority \
                --redfish-user root               # Redfish service (default
                                                  # https://127.0.0.1:443, CA
                                                  # directory as shown)
+graphql_server --redfish https://bmc:443 \
+               --redfish-client-cert client.pem \
+               --redfish-client-key client.key   # mutual TLS to Redfish
 graphql_server --redfish http://127.0.0.1:9000   # plain-http Redfish
 graphql_server --bus system                      # + live D-Bus sensors
 graphql_server --cert c.pem --key k.pem          # HTTPS (cert and key required)
@@ -279,7 +282,11 @@ Redfish is the default source: the example schema's `serviceRoot`, `systems`,
 `system`, `chassis`, `ethernetInterfaces`, `sensors` and `sensor` fields all
 read from the service given by `--redfish`. D-Bus is an optional addition:
 `--bus session|system` (default `none`) enables the `dbus*` fields; without it
-they are dropped at start-up. The Redfish token or password come from the
+they are dropped at start-up. When the Redfish service requires mutual TLS
+(bmcweb with client-certificate authentication), pass
+`--redfish-client-cert` and `--redfish-client-key` (PEM, given together); the
+certificate is presented during the TLS handshake and the server is still
+verified against `--redfish-ca`. The Redfish token or password come from the
 environment (`SUTRA_REDFISH_TOKEN`, or `SUTRA_REDFISH_PASSWORD` together with
 `--redfish-user`), never from the command line.
 

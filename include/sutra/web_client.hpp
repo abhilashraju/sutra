@@ -13,13 +13,18 @@
  * execute() snapshots the request, so the WebClient may be a temporary or
  * be reused (and modified) while earlier requests are still in flight.
  *
+ * Errors are values: execute() returns `Expected<HttpResponse>`. The fluent
+ * `with*` setters cannot report a failure without breaking the chain, so a
+ * bad URL is remembered and returned by the next execute()/buildRequest().
+ * HTTP error statuses are responses, not errors.
+ *
  * Retries: a request is attempted up to `maxTries` times with exponential
  * backoff. Retried are connect failures (always), transport failures while
  * exchanging (idempotent verbs; other verbs only when a reused keep-alive
  * connection turned out to be stale) and HTTP 5xx responses of idempotent
  * verbs. Protocol errors and TLS failures, in particular certificate
  * verification failures, are never retried. After the last attempt the last
- * 5xx response is returned, or the last error is thrown.
+ * 5xx response is returned, or the last error.
  *
  * TLS peers are always verified: the pool's ssl::context decides the trust
  * anchors (makeClientContext) and the certificate name is checked against the
@@ -109,15 +114,16 @@ inline bool isIdempotent(http::verb method)
 
 /**
  * @brief Splits an http(s) URL into its parts.
- * @throws std::invalid_argument for other schemes, user info, bad ports,
- *         empty hosts, or control characters.
+ * @return the parts, or `Errc::unsupportedScheme` for other schemes,
+ *         `Errc::missingHost` for an empty host, `Errc::invalidUrl` for user
+ *         info, bad ports, bad authorities or control characters.
  */
-inline ParsedUrl parseUrl(std::string_view url)
+inline Expected<ParsedUrl> parseUrl(std::string_view url)
 {
     ParsedUrl out;
     if (details::hasControlOrSpace(url))
     {
-        throw std::invalid_argument("url contains control characters");
+        return std::unexpected(make_error_code(Errc::invalidUrl));
     }
     constexpr std::string_view httpScheme = "http://";
     constexpr std::string_view httpsScheme = "https://";
@@ -132,7 +138,7 @@ inline ParsedUrl parseUrl(std::string_view url)
     }
     else
     {
-        throw std::invalid_argument("only http and https urls are supported");
+        return std::unexpected(make_error_code(Errc::unsupportedScheme));
     }
     if (auto fragment = url.find('#'); fragment != std::string_view::npos)
     {
@@ -144,7 +150,7 @@ inline ParsedUrl parseUrl(std::string_view url)
         authorityEnd == std::string_view::npos ? "" : url.substr(authorityEnd);
     if (authority.find('@') != std::string_view::npos)
     {
-        throw std::invalid_argument("user info in url is not supported");
+        return std::unexpected(make_error_code(Errc::invalidUrl));
     }
 
     std::string_view portText;
@@ -153,7 +159,7 @@ inline ParsedUrl parseUrl(std::string_view url)
         auto close = authority.find(']');
         if (close == std::string_view::npos)
         {
-            throw std::invalid_argument("unterminated IPv6 literal");
+            return std::unexpected(make_error_code(Errc::invalidUrl));
         }
         out.host = std::string(authority.substr(1, close - 1));
         authority.remove_prefix(close + 1);
@@ -161,7 +167,7 @@ inline ParsedUrl parseUrl(std::string_view url)
         {
             if (!authority.starts_with(':'))
             {
-                throw std::invalid_argument("bad authority in url");
+                return std::unexpected(make_error_code(Errc::invalidUrl));
             }
             portText = authority.substr(1);
         }
@@ -177,7 +183,7 @@ inline ParsedUrl parseUrl(std::string_view url)
     }
     if (out.host.empty())
     {
-        throw std::invalid_argument("url has no host");
+        return std::unexpected(make_error_code(Errc::missingHost));
     }
     if (portText.empty())
     {
@@ -191,7 +197,7 @@ inline ParsedUrl parseUrl(std::string_view url)
         if (ec != std::errc() || end != portText.data() + portText.size() ||
             value == 0 || value > 65535)
         {
-            throw std::invalid_argument("bad port in url");
+            return std::unexpected(make_error_code(Errc::invalidUrl));
         }
         out.port = std::string(portText);
     }
@@ -224,6 +230,7 @@ class WebClientT
         bool retryServerErrors = true;
     };
 
+    /** @throws std::invalid_argument for a null pool (a programming error). */
     explicit WebClientT(std::shared_ptr<Pool> connectionPool) :
         pool(std::move(connectionPool))
     {
@@ -325,19 +332,28 @@ class WebClientT
 
     /**
      * @brief Sets host, port and target from an http(s) URL.
-     * @throws std::invalid_argument when the URL is invalid or its scheme
-     *         does not match this client (https needs the TLS client).
+     *
+     * An invalid URL, or one whose scheme does not match this client (https
+     * needs the TLS client, `Errc::schemeMismatch`), leaves the request
+     * unchanged and is returned by the next execute() or buildRequest().
      */
     WebClientT& withUrl(std::string_view url)
     {
-        ParsedUrl parsed = parseUrl(url);
-        if (parsed.tls != isTls)
+        auto parsed = parseUrl(url);
+        if (!parsed)
         {
-            throw std::invalid_argument("url scheme does not match client");
+            urlError = parsed.error();
+            return *this;
         }
-        host = std::move(parsed.host);
-        port = std::move(parsed.port);
-        target = std::move(parsed.target);
+        if (parsed->tls != isTls)
+        {
+            urlError = make_error_code(Errc::schemeMismatch);
+            return *this;
+        }
+        urlError = error_code();
+        host = std::move(parsed->host);
+        port = std::move(parsed->port);
+        target = std::move(parsed->target);
         return *this;
     }
 
@@ -346,17 +362,25 @@ class WebClientT
         return pool;
     }
 
-    /** @brief Builds the request that execute() would send. */
-    HttpRequest buildRequest() const
+    /**
+     * @brief Builds the request that execute() would send.
+     * @return the request, or the error left by withUrl(), `missingHost`,
+     *         `invalidTarget` or `invalidHeader`.
+     */
+    Expected<HttpRequest> buildRequest() const
     {
+        if (urlError)
+        {
+            return std::unexpected(urlError);
+        }
         if (host.empty())
         {
-            throw std::invalid_argument("no host set");
+            return std::unexpected(make_error_code(Errc::missingHost));
         }
         if (target.empty() || target.front() != '/' ||
             details::hasControlOrSpace(target))
         {
-            throw std::invalid_argument("bad request target");
+            return std::unexpected(make_error_code(Errc::invalidTarget));
         }
         std::string fullTarget = target;
         bool first = fullTarget.find('?') == std::string::npos;
@@ -385,7 +409,7 @@ class WebClientT
                 name.find(':') != std::string::npos ||
                 value.find_first_of("\r\n") != std::string::npos)
             {
-                throw std::invalid_argument("bad header " + name);
+                return std::unexpected(make_error_code(Errc::invalidHeader));
             }
             req.set(name, value);
         }
@@ -397,16 +421,25 @@ class WebClientT
     /**
      * @brief Sends the request and returns the response.
      *
-     * HTTP error statuses are returned, not thrown. Transport failures
-     * (after retries) throw system_error.
+     * HTTP error statuses are responses, not errors. A request that cannot be
+     * built, or a transport failure after the retries, is the error.
      */
-    Task<HttpResponse> execute() const
+    Task<Expected<HttpResponse>> execute() const
     {
-        return run(pool, host, port, buildRequest(), retry, timeout);
+        auto req = buildRequest();
+        if (!req)
+        {
+            return failed<HttpResponse>(req.error());
+        }
+        return run(pool, host, port, std::move(*req), retry, timeout);
     }
 
-    /** @brief execute() and parse the body as JSON (throws on bad JSON). */
-    Task<nlohmann::json> executeJson() const
+    /**
+     * @brief execute() and parse the body as JSON.
+     * @return the JSON, `Errc::invalidJson` for a body that is not JSON, or
+     *         the execute() error.
+     */
+    Task<Expected<nlohmann::json>> executeJson() const
     {
         return jsonOf(execute());
     }
@@ -418,11 +451,16 @@ class WebClientT
      * the server ends the stream. The connection is never reused. There is
      * no retry; the idle timeout between events is `withTimeout()` (none by
      * default, since event streams may be quiet for long).
-     * @return the response status (check it for 2xx).
+     * @return the response status (check it for 2xx), or the failure.
      */
-    Task<http::status> executeAsStream(EventHandler onEvent) const
+    Task<Expected<http::status>> executeAsStream(EventHandler onEvent) const
     {
-        return stream(pool, host, port, buildRequest(), std::move(onEvent),
+        auto req = buildRequest();
+        if (!req)
+        {
+            return failed<http::status>(req.error());
+        }
+        return stream(pool, host, port, std::move(*req), std::move(onEvent),
                       timeout);
     }
 
@@ -439,10 +477,26 @@ class WebClientT
         bool reused = false;
     };
 
-    static Task<nlohmann::json> jsonOf(Task<HttpResponse> response)
+    template <class T>
+    static Task<Expected<T>> failed(error_code ec)
     {
-        HttpResponse res = co_await std::move(response);
-        co_return nlohmann::json::parse(res.body());
+        co_return std::unexpected(ec);
+    }
+
+    static Task<Expected<nlohmann::json>> jsonOf(
+        Task<Expected<HttpResponse>> response)
+    {
+        auto res = co_await std::move(response);
+        if (!res)
+        {
+            co_return std::unexpected(res.error());
+        }
+        auto body = nlohmann::json::parse(res->body(), nullptr, false);
+        if (body.is_discarded())
+        {
+            co_return std::unexpected(make_error_code(Errc::invalidJson));
+        }
+        co_return body;
     }
 
     static bool isRetryable(const error_code& ec, const Attempt& attempt,
@@ -478,13 +532,18 @@ class WebClientT
                 ec == net::error::broken_pipe);
     }
 
-    static Task<HttpResponse> attemptOnce(
+    static Task<Expected<HttpResponse>> attemptOnce(
         std::shared_ptr<Pool> pool, const std::string& host,
         const std::string& port, const HttpRequest& req,
         std::optional<Duration> timeout, Attempt& attempt)
     {
         attempt = Attempt{};
-        auto lease = co_await pool->acquire(host, port);
+        auto leased = co_await pool->acquire(host, port);
+        if (!leased)
+        {
+            co_return std::unexpected(leased.error());
+        }
+        typename Pool::Lease lease = std::move(*leased);
         attempt.phase = Phase::exchanging;
         attempt.reused = lease.reused();
         // Unless the exchange completes cleanly the connection is unusable.
@@ -493,55 +552,56 @@ class WebClientT
         {
             lease->setTimeout(timeout);
         }
-        HttpResponse res = co_await lease->send(req);
-        if (res.keep_alive() && req.keep_alive())
+        auto res = co_await lease->send(req);
+        if (!res)
+        {
+            co_return std::unexpected(res.error());
+        }
+        if (res->keep_alive() && req.keep_alive())
         {
             lease.markReusable();
         }
-        co_return res;
+        co_return std::move(*res);
     }
 
-    static Task<HttpResponse> run(
+    static Task<Expected<HttpResponse>> run(
         std::shared_ptr<Pool> pool, std::string host, std::string port,
         HttpRequest req, RetryPolicy policy, std::optional<Duration> timeout)
     {
         const bool idempotent = details::isIdempotent(req.method());
         Duration backoff = policy.initialBackoff;
         std::optional<HttpResponse> lastResponse;
-        std::exception_ptr lastError;
+        error_code lastError;
 
         for (int attemptNo = 1; attemptNo <= policy.maxTries; ++attemptNo)
         {
             Attempt attempt;
-            bool shouldRetry = false;
-            try
+            auto res =
+                co_await attemptOnce(pool, host, port, req, timeout, attempt);
+            if (res)
             {
-                HttpResponse res = co_await attemptOnce(pool, host, port, req,
-                                                        timeout, attempt);
-                if (res.result_int() >= 500 && idempotent &&
+                if (res->result_int() >= 500 && idempotent &&
                     policy.retryServerErrors)
                 {
-                    shouldRetry = true;
-                    lastError = nullptr;
-                    lastResponse = std::move(res);
+                    lastError = error_code();
+                    lastResponse = std::move(*res);
                 }
                 else
                 {
                     co_return res;
                 }
             }
-            catch (const system_error& e)
+            else
             {
-                if (!isRetryable(e.code(), attempt, idempotent))
+                if (!isRetryable(res.error(), attempt, idempotent))
                 {
-                    throw;
+                    co_return res;
                 }
-                shouldRetry = true;
                 lastResponse.reset();
-                lastError = std::current_exception();
+                lastError = res.error();
             }
 
-            if (!shouldRetry || attemptNo == policy.maxTries)
+            if (attemptNo == policy.maxTries)
             {
                 break;
             }
@@ -557,16 +617,21 @@ class WebClientT
 
         if (lastError)
         {
-            std::rethrow_exception(lastError);
+            co_return std::unexpected(lastError);
         }
         co_return std::move(*lastResponse);
     }
 
-    static Task<http::status> stream(
+    static Task<Expected<http::status>> stream(
         std::shared_ptr<Pool> pool, std::string host, std::string port,
         HttpRequest req, EventHandler onEvent, std::optional<Duration> timeout)
     {
-        auto lease = co_await pool->acquire(host, port);
+        auto leased = co_await pool->acquire(host, port);
+        if (!leased)
+        {
+            co_return std::unexpected(leased.error());
+        }
+        typename Pool::Lease lease = std::move(*leased);
         lease.markBad();
         lease->setTimeout(timeout);
         req.set(http::field::cache_control, "no-cache");
@@ -584,6 +649,8 @@ class WebClientT
     bool keepAlive = true;
     RetryPolicy retry;
     std::optional<Duration> timeout;
+    /** Failure of the last withUrl(); returned by buildRequest(). */
+    error_code urlError;
 };
 
 /** @brief Plain HTTP client. */

@@ -13,9 +13,9 @@
  * not used: its timer handler outlives the operation and touches the
  * use_sender operation state after it was destroyed.
  *
- * Outcomes of an operation: success returns normally, a timeout throws
- * `system_error(timed_out)`, any other failure throws `system_error`, and a
- * stop request (cancellation) completes the task as stopped.
+ * Outcomes of an operation: success returns the value, a timeout returns
+ * `timed_out`, any other failure returns its `error_code`, and a stop request
+ * (cancellation) completes the task as stopped. Nothing is thrown.
  */
 #pragma once
 
@@ -77,35 +77,28 @@ class Connection
         return timeout;
     }
 
-    /** @brief Writes all of `data`. */
-    Task<size_t> write(std::string_view data)
+    /**
+     * @brief Writes all of `data`.
+     * @return the byte count, or the failure (a timeout is `timed_out`).
+     */
+    Task<Expected<size_t>> write(std::string_view data)
     {
         arm(timeout);
         auto [ec, count] = co_await net::async_write(
             stream_, net::buffer(data.data(), data.size()), useSenderNoThrow);
-        co_await finishOp(ec);
+        if (auto failure = co_await checkOp(ec))
+        {
+            co_return std::unexpected(failure);
+        }
         co_return count;
     }
 
     /**
-     * @brief Like write(), but reports failure as a value instead of throwing.
-     * @return the failure (a timeout is `timed_out`), or a default error_code
-     *         on success. Cancellation still completes the task as stopped.
-     */
-    Task<error_code> tryWrite(std::string_view data)
-    {
-        arm(timeout);
-        auto [ec, count] = co_await net::async_write(
-            stream_, net::buffer(data.data(), data.size()), useSenderNoThrow);
-        static_cast<void>(count);
-        co_return co_await checkOp(ec);
-    }
-
-    /**
      * @brief Reads up to `maxBytes`. Returns buffered data first.
-     * @return the bytes read, or an empty string at end of stream.
+     * @return the bytes read, an empty string at end of stream, or the
+     *         failure.
      */
-    Task<std::string> readSome(size_t maxBytes = 4096)
+    Task<Expected<std::string>> readSome(size_t maxBytes = 4096)
     {
         if (inbuf.size() != 0)
         {
@@ -120,17 +113,21 @@ class Connection
             disarm();
             co_return std::string();
         }
-        co_await finishOp(ec);
+        if (auto failure = co_await checkOp(ec))
+        {
+            co_return std::unexpected(failure);
+        }
         chunk.resize(count);
         co_return chunk;
     }
 
     /**
      * @brief Reads until `delimiter` is seen.
-     * @return everything up to and including the delimiter. Extra bytes
-     *         stay buffered for the next read.
+     * @return everything up to and including the delimiter (extra bytes stay
+     *         buffered for the next read), or the failure. End of stream
+     *         before the delimiter is `eof`.
      */
-    Task<std::string> readUntil(std::string delimiter)
+    Task<Expected<std::string>> readUntil(std::string delimiter)
     {
         size_t scanned = 0;
         for (;;)
@@ -145,16 +142,25 @@ class Connection
             scanned = view.size() >= delimiter.size()
                           ? view.size() - delimiter.size() + 1
                           : 0;
-            co_await fill();
+            if (auto failure = co_await fill())
+            {
+                co_return std::unexpected(failure);
+            }
         }
     }
 
-    /** @brief Reads exactly `count` bytes (EOF before that is an error). */
-    Task<std::string> readExactly(size_t count)
+    /**
+     * @brief Reads exactly `count` bytes.
+     * @return the bytes, or the failure (end of stream before that is `eof`).
+     */
+    Task<Expected<std::string>> readExactly(size_t count)
     {
         while (inbuf.size() < count)
         {
-            co_await fill();
+            if (auto failure = co_await fill())
+            {
+                co_return std::unexpected(failure);
+            }
         }
         co_return take(count);
     }
@@ -165,46 +171,33 @@ class Connection
      * `initiate` receives the completion token and must start an operation
      * that completes with `(error_code, size_t)`, for example
      * `run([&](auto token) { return http::async_read(s, b, m, token); })`.
-     * @return the operation's byte count.
+     * @return the operation's byte count, or the failure.
      */
     template <class Initiate>
-    Task<size_t> run(Initiate initiate)
+    Task<Expected<size_t>> run(Initiate initiate)
     {
         arm(timeout);
         auto result = co_await initiate(useSenderNoThrow);
-        co_await finishOp(std::get<0>(result));
+        if (auto failure = co_await checkOp(std::get<0>(result)))
+        {
+            co_return std::unexpected(failure);
+        }
         co_return std::get<1>(result);
     }
 
-    /** @brief Like run(), but reports failure as a value (see tryWrite). */
-    template <class Initiate>
-    Task<error_code> tryRun(Initiate initiate)
-    {
-        arm(timeout);
-        auto result = co_await initiate(useSenderNoThrow);
-        co_return co_await checkOp(std::get<0>(result));
-    }
-
     /** @brief TLS handshake (TLS streams only), bounded by `limit`. */
-    Task<void> handshake(ssl::stream_base::handshake_type type,
-                         std::optional<Duration> limit)
+    Task<Expected<void>> handshake(ssl::stream_base::handshake_type type,
+                                   std::optional<Duration> limit)
     {
         static_assert(!std::is_same_v<Stream, tcp::socket>,
                       "handshake needs a TLS stream");
         arm(limit);
         auto result = co_await stream_.async_handshake(type, useSenderNoThrow);
-        co_await finishOp(std::get<0>(result));
-    }
-
-    /** @brief Like handshake(), but reports failure as a value. */
-    Task<error_code> tryHandshake(ssl::stream_base::handshake_type type,
-                                  std::optional<Duration> limit)
-    {
-        static_assert(!std::is_same_v<Stream, tcp::socket>,
-                      "handshake needs a TLS stream");
-        arm(limit);
-        auto result = co_await stream_.async_handshake(type, useSenderNoThrow);
-        co_return co_await checkOp(std::get<0>(result));
+        if (auto failure = co_await checkOp(std::get<0>(result)))
+        {
+            co_return std::unexpected(failure);
+        }
+        co_return Expected<void>();
     }
 
     /** @brief Shuts the socket down and closes it. Never throws. */
@@ -239,7 +232,7 @@ class Connection
 
     /**
      * @brief Starts the watchdog for one operation; nullopt means none.
-     * Pair every arm() with `co_await finishOp(ec)` on the operation result.
+     * Pair every arm() with `co_await checkOp(ec)` on the operation result.
      */
     void arm(std::optional<Duration> limit)
     {
@@ -260,7 +253,7 @@ class Connection
     }
 
     /**
-     * @brief Non-throwing form of finishOp().
+     * @brief Turns the result of an armed operation into its outcome.
      * @return success, `timed_out` for a watchdog expiry, or the failure.
      *         A cancellation that is not a timeout completes the task as
      *         stopped.
@@ -283,18 +276,12 @@ class Connection
         co_return ec;
     }
 
-    /** @brief Turns the result of an armed operation into the Task outcome. */
-    Task<void> finishOp(error_code ec)
-    {
-        if (auto failure = co_await checkOp(ec))
-        {
-            throw system_error(failure);
-        }
-    }
-
   private:
-    /** @brief Reads at least one more byte into the buffer; EOF throws. */
-    Task<void> fill()
+    /**
+     * @brief Reads at least one more byte into the buffer.
+     * @return success, or the failure (end of stream is `eof`).
+     */
+    Task<error_code> fill()
     {
         arm(timeout);
         auto [ec, got] = co_await stream_.async_read_some(inbuf.prepare(4096),
@@ -303,7 +290,7 @@ class Connection
         {
             inbuf.commit(got);
         }
-        co_await finishOp(ec);
+        co_return co_await checkOp(ec);
     }
 
     static bool isEndOfStream(const error_code& ec)

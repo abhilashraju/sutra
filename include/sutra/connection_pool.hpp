@@ -205,10 +205,10 @@ class ConnectionPoolT :
      * Reuses a live idle connection when there is one, opens a new one while
      * below the per-host limit, and otherwise waits for a lease to be
      * returned.
-     * @throws system_error connect/handshake failure, or `timed_out` when no
-     *         slot became free within `acquireTimeout`.
+     * @return the lease, the connect/handshake failure, or `timed_out` when
+     *         no slot became free within `acquireTimeout`.
      */
-    Task<Lease> acquire(std::string host, std::string port)
+    Task<Expected<Lease>> acquire(std::string host, std::string port)
     {
         auto self = this->shared_from_this();
         EndpointKey key{std::move(host), std::move(port), isTls};
@@ -231,7 +231,7 @@ class ConnectionPoolT :
             const auto remaining = deadline - std::chrono::steady_clock::now();
             if (remaining <= std::chrono::steady_clock::duration::zero())
             {
-                throw system_error(
+                co_return std::unexpected(
                     make_error_code(boost::system::errc::timed_out));
             }
             const bool woken = co_await state.waiters.wait(remaining);
@@ -242,7 +242,7 @@ class ConnectionPoolT :
             }
             if (!woken)
             {
-                throw system_error(
+                co_return std::unexpected(
                     make_error_code(boost::system::errc::timed_out));
             }
         }
@@ -358,14 +358,19 @@ class ConnectionPoolT :
         return hosts.try_emplace(key, executor).first->second;
     }
 
-    Task<Lease> open(std::shared_ptr<ConnectionPoolT> self, EndpointKey key,
-                     HostState& state)
+    Task<Expected<Lease>> open(std::shared_ptr<ConnectionPoolT> self,
+                               EndpointKey key, HostState& state)
     {
         ++state.active;
         Reservation reservation{*this, state};
         auto client = std::make_unique<Client>(executor, tlsContext);
         client->setConnectTimeout(config.connectTimeout);
-        co_await client->connect(key.host, key.port, config.tlsServerName);
+        auto connected =
+            co_await client->connect(key.host, key.port, config.tlsServerName);
+        if (!connected)
+        {
+            co_return std::unexpected(connected.error());
+        }
         client->setTimeout(config.requestTimeout);
         reservation.armed = false;
         co_return Lease(std::move(self), std::move(key), std::move(client),

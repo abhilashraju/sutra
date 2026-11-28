@@ -235,24 +235,36 @@ graphql::RedfishCredentials readRedfishCredentials(const Options& options)
     return credentials;
 }
 
+using RedfishBackendResult =
+    std::expected<std::shared_ptr<graphql::RedfishBackend>, std::string>;
+
 /** @brief Backend for an https Redfish service, verified against the CA dir. */
-std::shared_ptr<graphql::RedfishBackend> makeHttpsRedfishBackend(
+RedfishBackendResult makeHttpsRedfishBackend(
     net::io_context& ioc, const Options& options,
     const graphql::RedfishCredentials& credentials)
 {
-    auto context = std::make_shared<ssl::context>(makeClientContextWithCaPath(
-        options.redfishCa, options.redfishClientCert,
-        options.redfishClientKey));
+    auto context = makeClientContextWithCaPath(
+        options.redfishCa, options.redfishClientCert, options.redfishClientKey);
+    if (!context)
+    {
+        return std::unexpected(context.error().message());
+    }
+    auto sharedContext = std::make_shared<ssl::context>(std::move(*context));
     ConnectionPoolConfig poolConfig;
     poolConfig.tlsServerName = options.redfishServerName;
-    auto pool = HttpsConnectionPool::create(ioc.get_executor(), context.get(),
-                                            poolConfig, context);
-    return std::make_shared<graphql::RedfishHttpsBackend>(
+    auto pool = HttpsConnectionPool::create(
+        ioc.get_executor(), sharedContext.get(), poolConfig, sharedContext);
+    auto backend = graphql::RedfishHttpsBackend::create(
         pool, options.redfishUrl, credentials);
+    if (!backend)
+    {
+        return std::unexpected(backend.error().message());
+    }
+    return std::move(*backend);
 }
 
 /** @brief Backend for a plain-http Redfish service (warns about secrets). */
-std::shared_ptr<graphql::RedfishBackend> makeHttpRedfishBackend(
+RedfishBackendResult makeHttpRedfishBackend(
     net::io_context& ioc, const Options& options,
     const graphql::RedfishCredentials& credentials)
 {
@@ -261,8 +273,13 @@ std::shared_ptr<graphql::RedfishBackend> makeHttpRedfishBackend(
         logWarning("sending Redfish credentials over plain http");
     }
     auto pool = HttpConnectionPool::create(ioc.get_executor());
-    return std::make_shared<graphql::RedfishHttpBackend>(
-        pool, options.redfishUrl, credentials);
+    auto backend = graphql::RedfishHttpBackend::create(pool, options.redfishUrl,
+                                                       credentials);
+    if (!backend)
+    {
+        return std::unexpected(backend.error().message());
+    }
+    return std::move(*backend);
 }
 
 /** @brief Registers the Redfish source for `options.redfishUrl`. */
@@ -271,18 +288,19 @@ std::expected<void, std::string> addRedfishSource(
     graphql::SourceRegistry& registry)
 {
     const auto credentials = readRedfishCredentials(options);
-    try
+    auto url = parseUrl(options.redfishUrl);
+    if (!url)
     {
-        auto backend = parseUrl(options.redfishUrl).tls
-                           ? makeHttpsRedfishBackend(ioc, options, credentials)
-                           : makeHttpRedfishBackend(ioc, options, credentials);
-        registry.add(graphql::redfishSourceName,
-                     std::make_shared<graphql::RedfishSource>(backend));
+        return std::unexpected("--redfish: " + url.error().message());
     }
-    catch (const std::exception& e)
+    auto backend = url->tls ? makeHttpsRedfishBackend(ioc, options, credentials)
+                            : makeHttpRedfishBackend(ioc, options, credentials);
+    if (!backend)
     {
-        return std::unexpected(std::string("--redfish: ") + e.what());
+        return std::unexpected("--redfish: " + backend.error());
     }
+    registry.add(graphql::redfishSourceName,
+                 std::make_shared<graphql::RedfishSource>(*backend));
     return {};
 }
 
@@ -301,20 +319,17 @@ std::shared_ptr<sdbusplus::asio::connection> addDbusSource(
     {
         return nullptr;
     }
-    try
-    {
-        auto bus = makeConnection(ioc, options.bus == "session");
-        registry.add(graphql::dbusSourceName,
-                     std::make_shared<graphql::DbusSource>(
-                         std::make_shared<graphql::SutraDbusBackend>(bus)));
-        return bus;
-    }
-    catch (const std::exception& e)
+    auto bus = makeConnection(ioc, options.bus == "session");
+    if (!bus)
     {
         logWarning("D-Bus unavailable ({}); dbus fields are disabled",
-                   e.what());
+                   bus.error().message());
+        return nullptr;
     }
-    return nullptr;
+    registry.add(graphql::dbusSourceName,
+                 std::make_shared<graphql::DbusSource>(
+                     std::make_shared<graphql::SutraDbusBackend>(*bus)));
+    return *bus;
 }
 #else
 std::nullptr_t addDbusSource([[maybe_unused]] net::io_context& ioc,
@@ -418,8 +433,12 @@ std::expected<std::optional<ssl::context>, std::string> loadTlsContext(
     {
         return std::unexpected(pair.error());
     }
-    return std::optional<ssl::context>(
-        makeServerContext(pair->certificate, pair->privateKey));
+    auto context = makeServerContext(pair->certificate, pair->privateKey);
+    if (!context)
+    {
+        return std::unexpected("tls: " + context.error().message());
+    }
+    return std::optional<ssl::context>(std::move(*context));
 }
 
 // ---------------------------------------------------------------------------
@@ -463,12 +482,17 @@ class ShutdownHandler
     net::steady_timer grace;
 };
 
-std::unique_ptr<HttpServer> makeServer(
+std::expected<std::unique_ptr<HttpServer>, std::string> makeServer(
     net::io_context& ioc, const Options& options, HttpRouter& router,
     std::optional<ssl::context>& tlsContext)
 {
-    tcp::endpoint endpoint(net::ip::make_address(options.address),
-                           options.port);
+    error_code ec;
+    auto address = net::ip::make_address(options.address, ec);
+    if (ec)
+    {
+        return std::unexpected("bad --address: " + ec.message());
+    }
+    tcp::endpoint endpoint(address, options.port);
     if (tlsContext)
     {
         return std::make_unique<HttpServer>(ioc.get_executor(), endpoint,
@@ -481,14 +505,24 @@ std::unique_ptr<HttpServer> makeServer(
 int serve(net::io_context& ioc, const Options& options, HttpRouter& router,
           std::optional<ssl::context>& tlsContext)
 {
+    auto server = makeServer(ioc, options, router, tlsContext);
+    if (!server)
+    {
+        logError("{}", server.error());
+        return 1;
+    }
+    if (auto started = (*server)->start(); !started)
+    {
+        logError("cannot listen on {}:{}: {}", options.address, options.port,
+                 started.error().message());
+        return 1;
+    }
+    ShutdownHandler shutdown(ioc, **server);
+    logInfo("listening on {}://{}:{}/graphql", options.tls ? "https" : "http",
+            options.address, (*server)->localEndpoint().port());
     try
     {
-        auto server = makeServer(ioc, options, router, tlsContext);
-        server->start();
-        ShutdownHandler shutdown(ioc, *server);
-        logInfo("listening on {}://{}:{}/graphql",
-                options.tls ? "https" : "http", options.address,
-                server->localEndpoint().port());
+        // run() rethrows anything a completion handler lets escape.
         ioc.run();
     }
     catch (const std::exception& e)

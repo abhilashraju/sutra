@@ -297,21 +297,14 @@ void runWithServer(Body body)
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
                       router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const std::string url =
         "http://127.0.0.1:" + std::to_string(server.localEndpoint().port());
 
     exec::async_scope scope;
     auto wrapper = [&]() -> Task<void> {
-        try
-        {
-            co_await body(pool, url, seen);
-        }
-        catch (const std::exception& e)
-        {
-            ADD_FAILURE() << "client failed: " << e.what();
-        }
+        co_await body(pool, url, seen);
         server.stop();
     };
     spawnTask(scope, wrapper(), "redfish web backend test");
@@ -323,8 +316,14 @@ void runWithServer(Body body)
 TEST(RedfishWebBackend, GetsJsonWithBasicAuth)
 {
     runWithServer([](auto pool, std::string url, Seen& seen) -> Task<void> {
-        RedfishHttpBackend backend(pool, url, {"", "root", "0penBmc"});
-        auto r = co_await backend.get("/redfish/v1");
+        auto backend =
+            RedfishHttpBackend::create(pool, url, {"", "root", "0penBmc"});
+        EXPECT_TRUE(backend);
+        if (!backend)
+        {
+            co_return;
+        }
+        auto r = co_await (*backend)->get("/redfish/v1");
         EXPECT_TRUE(r.has_value());
         if (r)
         {
@@ -338,8 +337,14 @@ TEST(RedfishWebBackend, GetsJsonWithBasicAuth)
 TEST(RedfishWebBackend, TokenWinsOverPassword)
 {
     runWithServer([](auto pool, std::string url, Seen& seen) -> Task<void> {
-        RedfishHttpBackend backend(pool, url, {"tok", "root", "pw"});
-        auto r = co_await backend.get("/redfish/v1");
+        auto backend =
+            RedfishHttpBackend::create(pool, url, {"tok", "root", "pw"});
+        EXPECT_TRUE(backend);
+        if (!backend)
+        {
+            co_return;
+        }
+        auto r = co_await (*backend)->get("/redfish/v1");
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(seen.token, "tok");
         EXPECT_TRUE(seen.auth.empty());
@@ -349,7 +354,13 @@ TEST(RedfishWebBackend, TokenWinsOverPassword)
 TEST(RedfishWebBackend, ReportsHttpAndJsonErrors)
 {
     runWithServer([](auto pool, std::string url, Seen&) -> Task<void> {
-        RedfishHttpBackend backend(pool, url);
+        auto created = RedfishHttpBackend::create(pool, url);
+        EXPECT_TRUE(created);
+        if (!created)
+        {
+            co_return;
+        }
+        auto& backend = **created;
         auto denied = co_await backend.get("/redfish/v1/denied");
         EXPECT_FALSE(denied.has_value());
         EXPECT_NE(denied.error().find("HTTP 401"), std::string::npos);
@@ -366,10 +377,8 @@ TEST(RedfishWebBackend, RejectsBadBaseUrl)
 {
     net::io_context ioc;
     auto pool = HttpConnectionPool::create(ioc.get_executor());
-    EXPECT_THROW(RedfishHttpBackend(pool, "https://host"),
-                 std::invalid_argument);
-    EXPECT_THROW(RedfishHttpBackend(pool, "http://host/redfish/v1"),
-                 std::invalid_argument);
+    EXPECT_FALSE(RedfishHttpBackend::create(pool, "https://host"));
+    EXPECT_FALSE(RedfishHttpBackend::create(pool, "http://host/redfish/v1"));
 }
 
 namespace

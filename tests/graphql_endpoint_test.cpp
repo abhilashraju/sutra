@@ -26,28 +26,25 @@ void withClient(Body& body, EndpointOptions options = {})
     auto exec = graphql_fixture::makeExecutor(ioc.get_executor());
     registerGraphqlEndpoint(router, exec, options);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
 
     exec::async_scope scope;
-    bool failed = false;
     auto wrapper = [&]() -> Task<void> {
-        try
+        HttpClient client(ioc.get_executor());
+        auto connected = co_await client.connect(
+            "127.0.0.1", std::to_string(server.localEndpoint().port()));
+        if (connected)
         {
-            HttpClient client(ioc.get_executor());
-            co_await client.connect(
-                "127.0.0.1", std::to_string(server.localEndpoint().port()));
             co_await body(client);
         }
-        catch (const std::exception& e)
+        else
         {
-            ADD_FAILURE() << "client failed: " << e.what();
-            failed = true;
+            ADD_FAILURE() << "connect failed: " << connected.error().message();
         }
         server.stop();
     };
     spawnTask(scope, wrapper(), "graphql endpoint test");
     ioc.run();
-    EXPECT_FALSE(failed);
 }
 
 HttpRequest post(std::string body,
@@ -59,6 +56,14 @@ HttpRequest post(std::string body,
     return req;
 }
 
+/** Fails the test and leaves the coroutine when `result` holds an error. */
+#define CO_REQUIRE_OK(result)                                                  \
+    if (!(result))                                                             \
+    {                                                                          \
+        ADD_FAILURE() << #result << ": " << (result).error().message();        \
+        co_return;                                                             \
+    }
+
 } // namespace
 
 TEST(GraphqlEndpoint, PostQuery)
@@ -66,9 +71,10 @@ TEST(GraphqlEndpoint, PostQuery)
     auto body = [](HttpClient& client) -> Task<void> {
         json payload{{"query", "{ sensors { Id Status { Health } } }"}};
         auto res = co_await client.send(post(payload.dump()));
-        EXPECT_EQ(res.result(), http::status::ok);
-        EXPECT_EQ(res[http::field::content_type], "application/json");
-        json out = json::parse(res.body());
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        EXPECT_EQ((*res)[http::field::content_type], "application/json");
+        json out = json::parse(res->body());
         EXPECT_EQ(out["data"]["sensors"].size(), 2u);
         EXPECT_EQ(out["data"]["sensors"][0]["Status"]["Health"], "OK");
         EXPECT_FALSE(out.contains("errors"));
@@ -83,8 +89,10 @@ TEST(GraphqlEndpoint, PostWithVariables)
                                "Reading } }"},
                      {"variables", {{"id", "fan_1"}}}};
         auto res = co_await client.send(post(payload.dump()));
-        EXPECT_EQ(res.result(), http::status::ok);
-        EXPECT_EQ(json::parse(res.body())["data"]["sensor"]["Reading"], 3200.0);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        EXPECT_EQ(json::parse(res->body())["data"]["sensor"]["Reading"],
+                  3200.0);
     };
     withClient(body);
 }
@@ -94,8 +102,9 @@ TEST(GraphqlEndpoint, RawGraphqlContentType)
     auto body = [](HttpClient& client) -> Task<void> {
         auto res =
             co_await client.send(post("{ version }", "application/graphql"));
-        EXPECT_EQ(res.result(), http::status::ok);
-        EXPECT_EQ(json::parse(res.body())["data"]["version"], "1.2.3");
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        EXPECT_EQ(json::parse(res->body())["data"]["version"], "1.2.3");
     };
     withClient(body);
 }
@@ -109,8 +118,9 @@ TEST(GraphqlEndpoint, GetQuery)
             "%24i)%20%7B%20Id%20%7D%20%7D&variables=%7B%22i%22%3A%22fan_1%22%7D",
             11};
         auto res = co_await client.send(std::move(req));
-        EXPECT_EQ(res.result(), http::status::ok);
-        EXPECT_EQ(json::parse(res.body())["data"]["sensor"]["Id"], "fan_1");
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        EXPECT_EQ(json::parse(res->body())["data"]["sensor"]["Id"], "fan_1");
     };
     withClient(body);
 }
@@ -120,7 +130,8 @@ TEST(GraphqlEndpoint, GetDisabled)
     auto body = [](HttpClient& client) -> Task<void> {
         HttpRequest req{http::verb::get, "/graphql?query=%7Bversion%7D", 11};
         auto res = co_await client.send(std::move(req));
-        EXPECT_EQ(res.result(), http::status::method_not_allowed);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::method_not_allowed);
     };
     EndpointOptions options;
     options.allowGet = false;
@@ -132,8 +143,9 @@ TEST(GraphqlEndpoint, QueryErrorsStay200)
     auto body = [](HttpClient& client) -> Task<void> {
         json payload{{"query", "{ nope }"}};
         auto res = co_await client.send(post(payload.dump()));
-        EXPECT_EQ(res.result(), http::status::ok);
-        json out = json::parse(res.body());
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        json out = json::parse(res->body());
         EXPECT_FALSE(out.contains("data"));
         EXPECT_NE(out["errors"][0]["message"].get<std::string>().find(
                       "Unknown field"),
@@ -150,11 +162,13 @@ TEST(GraphqlEndpoint, BadRequestsAre400)
               R"({"query": "{ version }", "variables": [1]})"})
         {
             auto res = co_await client.send(post(bad));
-            EXPECT_EQ(res.result(), http::status::bad_request) << bad;
-            EXPECT_TRUE(json::parse(res.body()).contains("errors")) << bad;
+            CO_REQUIRE_OK(res);
+            EXPECT_EQ(res->result(), http::status::bad_request) << bad;
+            EXPECT_TRUE(json::parse(res->body()).contains("errors")) << bad;
         }
         auto res = co_await client.send(post(R"({"query": ""})"));
-        EXPECT_EQ(res.result(), http::status::bad_request);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::bad_request);
     };
     withClient(body);
 }
@@ -164,12 +178,14 @@ TEST(GraphqlEndpoint, OversizedQueryIsRejected)
     auto body = [](HttpClient& client) -> Task<void> {
         json payload{{"query", "{ version " + std::string(300, ' ') + "}"}};
         auto res = co_await client.send(post(payload.dump()));
-        EXPECT_EQ(res.result(), http::status::bad_request);
-        EXPECT_NE(res.body().find("too large"), std::string::npos);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::bad_request);
+        EXPECT_NE(res->body().find("too large"), std::string::npos);
 
         json small{{"query", "{ version }"}};
         res = co_await client.send(post(small.dump()));
-        EXPECT_EQ(res.result(), http::status::ok);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
     };
     EndpointOptions options;
     options.maxQueryBytes = 100;
@@ -181,8 +197,9 @@ TEST(GraphqlEndpoint, SubscriptionStatsEndpoint)
     auto body = [](HttpClient& client) -> Task<void> {
         HttpRequest req{http::verb::get, "/graphql/subscriptions/stats", 11};
         auto res = co_await client.send(std::move(req));
-        EXPECT_EQ(res.result(), http::status::ok);
-        json out = json::parse(res.body());
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        json out = json::parse(res->body());
         EXPECT_TRUE(out.contains("active_shared_loops"));
         EXPECT_TRUE(out.contains("total_client_subscribers"));
         EXPECT_TRUE(out.contains("multiplexed_subscribers"));
@@ -198,8 +215,9 @@ TEST(GraphqlEndpoint, EventsInjectionEndpoint)
         req.set(http::field::content_type, "application/json");
         req.body() = R"({"fields": ["sensorUpdates", "chassisUpdates"]})";
         auto res = co_await client.send(std::move(req));
-        EXPECT_EQ(res.result(), http::status::ok);
-        json out = json::parse(res.body());
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        json out = json::parse(res->body());
         EXPECT_EQ(out["fired"], true);
         EXPECT_EQ(out["fields"].size(), 2u);
 
@@ -208,7 +226,8 @@ TEST(GraphqlEndpoint, EventsInjectionEndpoint)
         badReq.set(http::field::content_type, "application/json");
         badReq.body() = R"({"fields": []})";
         auto badRes = co_await client.send(std::move(badReq));
-        EXPECT_EQ(badRes.result(), http::status::bad_request);
+        CO_REQUIRE_OK(badRes);
+        EXPECT_EQ(badRes->result(), http::status::bad_request);
     };
     withClient(body);
 }

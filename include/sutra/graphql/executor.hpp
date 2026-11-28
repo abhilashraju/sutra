@@ -221,19 +221,15 @@ class Executor : public std::enable_shared_from_this<Executor>
     Task<nlohmann::json> execute(
         std::string query, nlohmann::json variables = nlohmann::json::object())
     {
-        Result<Operation> parsed = Parser::tryParse(query);
+        Result<Operation> parsed = Parser::parse(query);
         if (!parsed)
         {
             co_return errorResponse(parsed.error());
         }
         Operation operation = std::move(*parsed);
-        try
+        if (auto expanded = expandFragments(operation); !expanded)
         {
-            expandFragments(operation);
-        }
-        catch (const std::exception& e)
-        {
-            co_return errorResponse(e.what());
+            co_return errorResponse(expanded.error());
         }
         if (auto r = schema.validateOperation(operation); !r)
         {
@@ -290,13 +286,15 @@ class Executor : public std::enable_shared_from_this<Executor>
         ioExecutor = std::move(exec);
     }
 
-    net::any_io_executor getAnyExecutor() const
+    /** @brief The configured I/O executor, or an error when there is none. */
+    Result<net::any_io_executor> getAnyExecutor() const
     {
         if (ioExecutor)
         {
             return *ioExecutor;
         }
-        throw std::runtime_error("No I/O executor configured on Executor");
+        return std::unexpected(
+            std::string("No I/O executor configured on Executor"));
     }
 
     /** @brief Root fields resolved at the same time (default 8). */
@@ -489,7 +487,7 @@ class Executor : public std::enable_shared_from_this<Executor>
                                    std::shared_ptr<SubscriptionTrigger> trigger,
                                    AsyncEventFn onEvent)
     {
-        Result<Operation> parseResult = Parser::tryParse(query);
+        Result<Operation> parseResult = Parser::parse(query);
         if (!parseResult)
         {
             nlohmann::json err = errorResponse(parseResult.error());
@@ -503,18 +501,9 @@ class Executor : public std::enable_shared_from_this<Executor>
             operation.type = Operation::Type::Subscription;
         }
 
-        std::string expandError;
-        try
+        if (auto expanded = expandFragments(operation); !expanded)
         {
-            expandFragments(operation);
-        }
-        catch (const std::exception& e)
-        {
-            expandError = e.what();
-        }
-        if (!expandError.empty())
-        {
-            nlohmann::json err = errorResponse(expandError);
+            nlohmann::json err = errorResponse(expanded.error());
             co_await onEvent(std::move(err));
             co_return;
         }
@@ -556,8 +545,20 @@ class Executor : public std::enable_shared_from_this<Executor>
             session = it->second;
         }
 
-        net::any_io_executor exec = getExecutorForTimer(session->trigger.get());
-        auto disconnectTimer = std::make_shared<net::steady_timer>(exec);
+        auto exec = getExecutorForTimer(session->trigger.get());
+        if (!exec)
+        {
+            // Nothing can run the session without an executor; undo the
+            // registration made above.
+            if (isNewSession)
+            {
+                activeSubscriptions.erase(key);
+            }
+            nlohmann::json err = errorResponse(exec.error());
+            co_await onEvent(std::move(err));
+            co_return;
+        }
+        auto disconnectTimer = std::make_shared<net::steady_timer>(*exec);
         disconnectTimer->expires_at(net::steady_timer::time_point::max());
 
         uint64_t subId = session->nextSubscriberId++;
@@ -801,7 +802,8 @@ class Executor : public std::enable_shared_from_this<Executor>
         return false;
     }
 
-    net::any_io_executor getExecutorForTimer(SubscriptionTrigger* trigger) const
+    Result<net::any_io_executor> getExecutorForTimer(
+        SubscriptionTrigger* trigger) const
     {
         if (trigger)
         {
@@ -814,8 +816,8 @@ class Executor : public std::enable_shared_from_this<Executor>
         {
             return *ioExecutor;
         }
-        throw std::runtime_error(
-            "No I/O executor available for subscription timer");
+        return std::unexpected(
+            std::string("No I/O executor available for subscription timer"));
     }
 
     Task<Result<nlohmann::json>> projectList(

@@ -14,19 +14,32 @@ namespace sutra
 
 /**
  * @brief Resolves `host` and connects the lowest layer of `conn` to `port`.
- * @throws system_error on resolve/connect failure or timeout.
+ * @return success, or the resolve/connect failure (`timed_out` on timeout).
  */
 template <class Stream>
-Task<void> connectStream(
+Task<Expected<void>> connectStream(
     Connection<Stream>& conn, net::any_io_executor executor, std::string host,
     std::string port, std::optional<std::chrono::steady_clock::duration> limit)
 {
     tcp::resolver resolver(executor);
-    auto endpoints = co_await resolver.async_resolve(host, port, useSender);
+    auto [resolveEc, endpoints] =
+        co_await resolver.async_resolve(host, port, useSenderNoThrow);
+    if (resolveEc == net::error::operation_aborted)
+    {
+        co_await ex::just_stopped();
+    }
+    if (resolveEc)
+    {
+        co_return std::unexpected(resolveEc);
+    }
     conn.arm(limit);
     auto result =
         co_await net::async_connect(conn.lowest(), endpoints, useSenderNoThrow);
-    co_await conn.finishOp(std::get<0>(result));
+    if (auto failure = co_await conn.checkOp(std::get<0>(result)))
+    {
+        co_return std::unexpected(failure);
+    }
+    co_return Expected<void>();
 }
 
 class TcpClient : public TcpConnection
@@ -38,12 +51,13 @@ class TcpClient : public TcpConnection
 
     /**
      * @brief Resolves `host` and connects to `port` (a number or a service).
-     * @throws system_error on resolve/connect failure or timeout.
+     * @return success, or the resolve/connect failure (`timed_out` on
+     *         timeout).
      */
-    Task<void> connect(std::string host, std::string port)
+    Task<Expected<void>> connect(std::string host, std::string port)
     {
-        co_await connectStream(*this, executor, std::move(host),
-                               std::move(port), connectTimeout);
+        return connectStream(*this, executor, std::move(host), std::move(port),
+                             connectTimeout);
     }
 
     /** @brief Timeout for connect(); read/write use setTimeout(). */

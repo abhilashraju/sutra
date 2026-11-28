@@ -456,27 +456,71 @@ class RedfishWebBackend : public RedfishBackend
     using Pool = typename Client::Pool;
 
     /**
-     * @param pool       Connection pool on the io_context that runs queries.
+     * @param pool       Connection pool on the io_context that runs queries;
+     *                   must not be null.
      * @param baseUrl    `http(s)://host[:port]`; the scheme must match
      *                   `Stream` and no path is allowed.
      * @param credentials Optional authentication.
-     * @throws std::invalid_argument for a bad URL or credentials.
+     * @return the backend, or the URL error: `Errc::schemeMismatch` when the
+     *         scheme is not the one of `Stream`, `Errc::invalidUrl` for a
+     *         base url with a path, or what parseUrl() reports.
      */
-    RedfishWebBackend(std::shared_ptr<Pool> pool, std::string_view baseUrl,
-                      const RedfishCredentials& credentials = {}) :
-        pool(std::move(pool))
+    static Expected<std::shared_ptr<RedfishWebBackend>> create(
+        std::shared_ptr<Pool> pool, std::string_view baseUrl,
+        const RedfishCredentials& credentials = {})
     {
-        ParsedUrl parsed = parseUrl(baseUrl);
-        if (parsed.tls != Client::isTls)
+        auto parsed = parseUrl(baseUrl);
+        if (!parsed)
         {
-            throw std::invalid_argument("url scheme does not match backend");
+            return std::unexpected(parsed.error());
         }
-        if (parsed.target != "/")
+        if (parsed->tls != Client::isTls)
         {
-            throw std::invalid_argument("base url must not have a path");
+            return std::unexpected(make_error_code(Errc::schemeMismatch));
         }
-        host = std::move(parsed.host);
-        port = std::move(parsed.port);
+        if (parsed->target != "/")
+        {
+            return std::unexpected(make_error_code(Errc::invalidUrl));
+        }
+        return std::shared_ptr<RedfishWebBackend>(
+            new RedfishWebBackend(std::move(pool), std::move(parsed->host),
+                                  std::move(parsed->port), credentials));
+    }
+
+    Task<Result<nlohmann::json>> get(std::string target) override
+    {
+        Client client(pool);
+        client.withHost(host).withPort(port).withTarget(target).withHeaders(
+            headers);
+        auto res = co_await client.execute();
+        if (!res)
+        {
+            co_return std::unexpected(
+                "Redfish GET " + target + " failed: " + res.error().message());
+        }
+        if (res->result_int() < 200 || res->result_int() > 299)
+        {
+            co_return std::unexpected(
+                "Redfish GET " + target + " returned HTTP " +
+                std::to_string(res->result_int()));
+        }
+        nlohmann::json body =
+            nlohmann::json::parse(res->body(), nullptr, false);
+        if (body.is_discarded())
+        {
+            co_return std::unexpected(
+                "Redfish GET " + target + " returned invalid JSON");
+        }
+        co_return body;
+    }
+
+  private:
+    RedfishWebBackend(std::shared_ptr<Pool> poolArg, std::string hostArg,
+                      std::string portArg,
+                      const RedfishCredentials& credentials) :
+        pool(std::move(poolArg)), host(std::move(hostArg)),
+        port(std::move(portArg))
+    {
         headers["Accept"] = "application/json";
         if (!credentials.token.empty())
         {
@@ -491,37 +535,6 @@ class RedfishWebBackend : public RedfishBackend
         }
     }
 
-    Task<Result<nlohmann::json>> get(std::string target) override
-    {
-        try
-        {
-            Client client(pool);
-            client.withHost(host).withPort(port).withTarget(target).withHeaders(
-                headers);
-            HttpResponse res = co_await client.execute();
-            if (res.result_int() < 200 || res.result_int() > 299)
-            {
-                co_return std::unexpected(
-                    "Redfish GET " + target + " returned HTTP " +
-                    std::to_string(res.result_int()));
-            }
-            nlohmann::json body =
-                nlohmann::json::parse(res.body(), nullptr, false);
-            if (body.is_discarded())
-            {
-                co_return std::unexpected(
-                    "Redfish GET " + target + " returned invalid JSON");
-            }
-            co_return body;
-        }
-        catch (const std::exception& e)
-        {
-            co_return std::unexpected(
-                "Redfish GET " + target + " failed: " + e.what());
-        }
-    }
-
-  private:
     std::shared_ptr<Pool> pool;
     std::string host;
     std::string port;

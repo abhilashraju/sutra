@@ -18,19 +18,15 @@ namespace sutra::graphql
 class Parser
 {
   public:
-    static Operation parse(const std::string& query)
-    {
-        Impl impl(query);
-        return impl.parseDocument();
-    }
-
     // Returns the parsed Operation, or an error message on parse failure.
-    // Replaces the two-step validate()+parse() idiom used in the executor.
-    static Result<Operation> tryParse(const std::string& query)
+    // The recursive-descent implementation reports syntax errors internally
+    // with exceptions; they never escape this function.
+    static Result<Operation> parse(const std::string& query)
     {
         try
         {
-            return parse(query);
+            Impl impl(query);
+            return impl.parseDocument();
         }
         catch (const std::exception& e)
         {
@@ -38,19 +34,15 @@ class Parser
         }
     }
 
-    static bool validate(const std::string& query, std::string& errorMsg)
+    // Checks that `query` is syntactically valid.
+    static Result<void> validate(const std::string& query)
     {
-        try
+        auto parsed = parse(query);
+        if (!parsed)
         {
-            parse(query);
-            errorMsg.clear();
-            return true;
+            return std::unexpected(std::move(parsed.error()));
         }
-        catch (const std::exception& e)
-        {
-            errorMsg = e.what();
-            return false;
-        }
+        return {};
     }
 
   private:

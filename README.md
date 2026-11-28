@@ -81,8 +81,17 @@ exec::async_scope scope;
 
 net::steady_timer timer(ioc);
 timer.expires_after(10ms);
-co_await timer.async_wait(useSender);       // throws system_error on failure
 auto [ec] = co_await timer.async_wait(useSenderNoThrow);  // error as value
+```
+
+Fallible sutra operations return `Expected<T>`, an alias of
+`std::expected<T, boost::system::error_code>`. Errors raised by sutra itself
+(bad URL, bad header, invalid JSON, ...) use `Errc`, which converts to an
+`error_code`:
+
+```cpp
+auto url = parseUrl("ftp://host/");
+if (!url && url.error() == Errc::unsupportedScheme) { /* ... */ }
 ```
 
 `WaitQueue` is a condition-variable-like primitive:
@@ -97,7 +106,8 @@ std::vector<Task<int>> tasks = ...;
 std::vector<int> results = co_await gather(std::move(tasks), 4);
 ```
 
-Results keep input order. If a task fails, its siblings still run to
+Results keep input order. `gather()` is generic and keeps the task's own
+failure channel: if a task throws, its siblings still run to
 completion and the first failure in input order is rethrown. A stop request is
 forwarded to the children and the gather completes as stopped. Everything stays
 on the calling io_context thread, so no locking is needed.
@@ -126,21 +136,38 @@ bool tls = cmd.isSet("--tls");
 ```cpp
 TcpServer server(ioc.get_executor(), "127.0.0.1", 9000,
                  [](TcpConnection conn) -> Task<void> {
-                     std::string line = co_await conn.readUntil("\n");
-                     co_await conn.write(line);
+                     auto line = co_await conn.readUntil("\n");
+                     if (line)
+                     {
+                         co_await conn.write(*line);
+                     }
                  });
-server.start();                    // 0.0.0.0 / :: are refused
+if (auto started = server.start(); !started)   // binds and listens;
+{                                              // 0.0.0.0 / :: are refused
+    log(started.error().message());
+}
 
 TcpClient client(ioc.get_executor());
-co_await client.connect("127.0.0.1", "9000");
+if (auto connected = co_await client.connect("127.0.0.1", "9000"); !connected)
+{
+    /* connected.error(): resolve/connect failure, or timed_out */
+}
 ```
+
+`TcpServer` / `HttpServer` constructors do not fail for runtime input: opening
+and binding the listener happens in `start()`, which returns `Expected<void>`.
 
 `Connection<Stream>` owns the read buffer and a watchdog: every operation has
 a timeout (`setTimeout`) and `run(initiate)` wraps any Beast operation.
+`write`, `readSome`, `readUntil`, `readExactly` and `run` return
+`Task<Expected<...>>`; a peer that closes the connection yields
+`boost::asio::error::eof`.
 `cert_generator.hpp` creates self-signed PEMs and TLS 1.2+ contexts:
-`makeServerContext(cert, key)` and `makeClientContext(trustedPem)` (peer
-verification is always on; with an empty `trustedPem` the system store is
-used).
+`generateSelfSignedCertificate(host)`, `makeServerContext(cert, key)` and
+`makeClientContext(trustedPem)` (peer verification is always on; with an empty
+`trustedPem` the system store is used). All of them return `Expected<...>`; an
+OpenSSL failure is an `error_code` in the OpenSSL error category, a bad
+argument an `Errc`.
 
 ### HTTP server and client
 
@@ -159,13 +186,23 @@ router.sse("/events", [](HttpRequest&, RequestContext&, SseWriter& out) -> Task<
 });
 
 HttpServer server(ioc.get_executor(), endpoint, router);            // HTTP
-HttpServer tls(ioc.get_executor(), endpoint, router, serverCtx);    // HTTPS
+HttpServer tls(ioc.get_executor(), endpoint, router, *serverCtx);   // HTTPS
+if (!server.start()) { /* Expected<void> */ }
+
+HttpClient client(ioc.get_executor());
+if (co_await client.connect("127.0.0.1", port))
+{
+    auto res = co_await client.send(request);   // Expected<HttpResponse>
+    if (res) { use(res->result(), res->body()); }
+}
 ```
 
 `HttpServer` supports keep-alive, a body size limit and request timeouts
 (`HttpServerOptions`). `HttpClient` / `HttpsClient` are one connection each:
-`connect(host, port)`, `send(req)`, `subscribe(req, onEvent)` for SSE. HTTPS
-sends SNI and verifies the certificate against the host name.
+`connect(host, port)` returns `Expected<void>`, `send(req)` returns
+`Expected<HttpResponse>` and `subscribe(req, onEvent)` for SSE returns
+`Expected<http::status>`. HTTPS sends SNI and verifies the certificate against
+the host name; a failed verification is an error in the TLS category.
 
 ### Connection pool and `WebClient`
 
@@ -175,15 +212,21 @@ WebClient web(pool);
 auto res = co_await web.withUrl("http://127.0.0.1:8080/items?x=1")
                        .withMethod(http::verb::get)
                        .withRetries(3)
-                       .execute();
-auto json = co_await web.withUrl(...).executeJson();
-co_await web.withUrl(".../events").executeAsStream(
+                       .execute();            // Expected<HttpResponse>
+if (!res) { /* res.error(): Errc, timed_out, connect/TLS error, ... */ }
+auto json = co_await web.withUrl(...).executeJson();   // Expected<json>
+auto status = co_await web.withUrl(".../events").executeAsStream(
     [](std::string event) { return true; /* false stops the stream */ });
 ```
 
+`parseUrl()` returns `Expected<ParsedUrl>` and `buildRequest()` returns
+`Expected<HttpRequest>`. The fluent setters never fail: `withUrl()` remembers
+a bad URL (or an `http` URL on a TLS client, `Errc::schemeMismatch`) and
+`execute()` / `buildRequest()` report it.
+
 * `ConnectionPoolConfig{maxConnectionsPerHost = 5, idleTimeout = 30 s,
   acquireTimeout = 10 s, ...}`; `acquire()` waits (through a `WaitQueue`)
-  until a lease frees up and throws `timed_out` otherwise. Leases are RAII and
+  until a lease frees up and returns `timed_out` otherwise. Leases are RAII and
   return to the pool unless marked bad. Idle connections expire and
   connections closed by the peer are dropped before reuse.
 * HTTPS: `SecureWebClient` / `HttpsConnectionPool::create(executor, &ctx)`
@@ -197,10 +240,12 @@ co_await web.withUrl(".../events").executeAsStream(
 
 ```cpp
 auto conn = makeConnection(ioc, /*session=*/false); // works with older sdbusplus too
-auto& bus = *conn;
+if (!conn) { /* conn.error(): the errno-style code sdbusplus reported */ }
+auto& bus = **conn;
 auto state = co_await getProperty<std::string>(
     bus, "xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0",
     "xyz.openbmc_project.State.Host", "CurrentHostState");
+if (!state) { /* state.error() is an error_code */ }
 auto tree = co_await getSubTree(bus, "/xyz/openbmc_project/sensors", 0,
                                 {"xyz.openbmc_project.Sensor.Value"});
 ```
@@ -208,12 +253,18 @@ auto tree = co_await getSubTree(bus, "/xyz/openbmc_project/sensors", 0,
 Same shape as the coroserver helpers: `dbusMethodCall<Ret...>`,
 `getProperty`, `setProperty`, `getAllProperties`, `callObjectMapperMethod`,
 `getSubTree`, `getObjects`, `getSubTreePaths`, the `getAssociated*` family,
-`getManagedObjects`, `introspect`. Failures throw `system_error`.
+`getManagedObjects`, `introspect`. `makeConnection` returns
+`Expected<std::shared_ptr<connection>>`. Each helper returns
+`Task<DbusExpected<T>>`
+(`std::expected<T, error_code>`); failures are returned, not thrown.
+`getPropertyFromMap` / `getPropertiesFromMap` return `DbusExpected` too.
 
 ### GraphQL (`graphql/`)
 
-* `Parser::parse/tryParse/validate` (queries, variables with defaults,
-  directives, named and inline fragments, depth limit 20).
+* `Parser::parse/validate` return `Result<Operation>` / `Result<void>`
+  (`Result<T>` is `std::expected<T, std::string>`; queries, variables with
+  defaults, directives, named and inline fragments, depth limit 20).
+  `expandFragments()` returns `Result<void>`.
 * `Schema` is JSON driven (`objects[]`, `queries[]`; see
   `examples/graphql_server/schema.json`). Each root query names a `source`
   and an optional `sourceConfig`.
@@ -237,8 +288,10 @@ Same shape as the coroserver helpers: `dbusMethodCall<Ret...>`,
   skipped with a warning). The schema's `responseKey`s are Redfish property
   names. `RedfishHttpBackend` / `RedfishHttpsBackend` (pooled, TLS verified
   against `makeClientContext`) send `X-Auth-Token` or HTTP Basic credentials
-  (`RedfishCredentials`); implement `RedfishBackend` to supply another
-  transport.
+  (`RedfishCredentials`). They are created with
+  `RedfishHttpBackend::create(pool, baseUrl, credentials)`, which returns
+  `Expected<std::shared_ptr<...>>` (a bad base URL is an error, not an
+  exception). Implement `RedfishBackend` to supply another transport.
 * `Executor::execute(query, variables) -> Task<json>` returns `{"data":...}`
   or `{"errors":[{"message":...}]}`.
 * `registerGraphqlEndpoint(router, executor, options)` adds
@@ -298,12 +351,22 @@ ObjectMapper) reproduce the sessions used to test it.
 
 ## Error and cancellation model
 
-* **Errors are exceptions inside tasks.** Failed I/O completes the sender
-  with an `exception_ptr` holding a `boost::system::system_error`
-  (`errorCodeOf(eptr)` extracts the code). Use `useSenderNoThrow` /
-  `net::as_tuple` when an error is part of normal control flow.
+* **Errors are values.** Every fallible public operation returns
+  `Expected<T>` (`std::expected<T, boost::system::error_code>`); the
+  GraphQL layer uses `Result<T>` (`std::expected<T, std::string>`). Nothing in
+  the public API throws for runtime failures. Library-defined failures use
+  `Errc` (`invalidUrl`, `unsupportedScheme`, `schemeMismatch`, `missingHost`,
+  `invalidTarget`, `invalidHeader`, `invalidJson`, `opensslFailure`,
+  `invalidCaPath`, `incompleteClientCredentials`, `unspecifiedAddress`);
+  everything else is the Asio / OpenSSL / sd-bus code that occurred.
+  Internally the operations use `useSenderNoThrow`, so an error is never
+  turned into an exception. The only exceptions are programmer errors in
+  constructors and setup calls (`std::invalid_argument`): a null pool, a TLS
+  client or pool without an `ssl::context`, or a `CommandLine` option declared
+  without a name. The GraphQL parser throws internally but catches at the
+  `Parser::parse` boundary.
 * **Timeouts** are enforced per operation by the connection watchdog and
-  surface as `system_error(timed_out)`.
+  are returned as `timed_out`.
 * **Cancellation is the stopped channel.** A stop request on an operation's
   environment cancels the pending Asio operation, which completes as
   *stopped* (not as an error). `spawnTask` logs errors and swallows stops, so
@@ -313,8 +376,10 @@ ObjectMapper) reproduce the sessions used to test it.
 * A pending **D-Bus call cannot be revoked**; a stop is noticed when the
   reply (or sdbusplus' own timeout) arrives.
 * **HTTP layer:** protocol violations answer 400/413/etc. and close the
-  connection; handler exceptions become `500` with a generic body (details go
-  to the log only).
+  connection; a route handler that throws becomes a `500` with a generic body
+  (details go to the log only).
+* **Tasks you write** may still throw: `gather()` and `spawnTask` keep the
+  task's own exception channel, and `spawnTask` logs what it catches.
 * **GraphQL:** invalid queries, validation failures and data-source failures
   are reported in `errors` with HTTP 200; malformed HTTP requests (bad JSON,
   oversized query, wrong types) get 400.

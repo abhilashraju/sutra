@@ -5,9 +5,19 @@
 
 using namespace sutra::graphql;
 
+namespace
+{
+Operation requireParse(const std::string& query)
+{
+    auto parsed = Parser::parse(query);
+    EXPECT_TRUE(parsed.has_value()) << (parsed ? "" : parsed.error());
+    return parsed ? std::move(*parsed) : Operation{};
+}
+} // namespace
+
 TEST(GraphqlParser, QueryWithVariables)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "query GetUser($userId: Int!) { user(id: $userId) { id name } }");
 
     EXPECT_EQ(operation.type, Operation::Type::Query);
@@ -24,7 +34,7 @@ TEST(GraphqlParser, QueryWithVariables)
 
 TEST(GraphqlParser, LiteralArguments)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "mutation { create(name: \"Test User\", age: 25, ok: true) { id } }");
 
     EXPECT_EQ(operation.type, Operation::Type::Mutation);
@@ -37,7 +47,7 @@ TEST(GraphqlParser, LiteralArguments)
 
 TEST(GraphqlParser, DefaultValuesAndLists)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "query($input: Input = {enabled: true, ids: [1, 2, 3]}) { users { id } "
         "}");
 
@@ -51,7 +61,7 @@ TEST(GraphqlParser, DefaultValuesAndLists)
 
 TEST(GraphqlParser, Directives)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "query Q @skip(if: false) { users @include(if: true) { id } }");
 
     EXPECT_EQ(operation.directives.size(), 1u);
@@ -61,7 +71,7 @@ TEST(GraphqlParser, Directives)
 
 TEST(GraphqlParser, NamedFragmentsExpand)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "query { user { ...UserFields } }"
         " fragment UserFields on User { id name email }");
 
@@ -70,7 +80,7 @@ TEST(GraphqlParser, NamedFragmentsExpand)
     EXPECT_FALSE(
         operation.selections[0].selections[0].fragmentSpreadName.empty());
 
-    expandFragments(operation);
+    ASSERT_TRUE(expandFragments(operation));
     const auto& fields = operation.selections[0].selections;
     ASSERT_EQ(fields.size(), 3u);
     EXPECT_EQ(fields[0].name, "id");
@@ -81,36 +91,36 @@ TEST(GraphqlParser, NamedFragmentsExpand)
 TEST(GraphqlParser, InlineFragmentsExpandAtParseTime)
 {
     Operation operation =
-        Parser::parse("query { user { id ... on User { name email } } }");
+        requireParse("query { user { id ... on User { name email } } }");
 
-    expandFragments(operation);
+    ASSERT_TRUE(expandFragments(operation));
     const auto& fields = operation.selections[0].selections;
     ASSERT_EQ(fields.size(), 3u);
     EXPECT_EQ(fields[1].name, "name");
 }
 
-TEST(GraphqlParser, CircularFragmentsThrow)
+TEST(GraphqlParser, CircularFragmentsAreRejected)
 {
-    Operation operation = Parser::parse(
+    Operation operation = requireParse(
         "query { a { ...FragA } }"
         " fragment FragA on T { b { ...FragB } }"
         " fragment FragB on T { c { ...FragA } }");
 
-    EXPECT_THROW(expandFragments(operation), std::runtime_error);
+    EXPECT_FALSE(expandFragments(operation));
 }
 
-TEST(GraphqlParser, UnknownFragmentThrows)
+TEST(GraphqlParser, UnknownFragmentIsRejected)
 {
-    Operation operation = Parser::parse("query { a { ...Missing } }");
-    EXPECT_THROW(expandFragments(operation), std::runtime_error);
+    Operation operation = requireParse("query { a { ...Missing } }");
+    EXPECT_FALSE(expandFragments(operation));
 }
 
 TEST(GraphqlParser, InvalidSyntaxIsReported)
 {
-    std::string error;
-    EXPECT_FALSE(Parser::validate("query { users { id name }", error));
-    EXPECT_FALSE(error.empty());
-    EXPECT_FALSE(Parser::tryParse("{ a(b: ) }"));
+    auto validated = Parser::validate("query { users { id name }");
+    ASSERT_FALSE(validated);
+    EXPECT_FALSE(validated.error().empty());
+    EXPECT_FALSE(Parser::parse("{ a(b: ) }"));
 }
 
 TEST(GraphqlParser, DeepNestingIsRejected)
@@ -124,5 +134,5 @@ TEST(GraphqlParser, DeepNestingIsRejected)
     {
         query += "}";
     }
-    EXPECT_FALSE(Parser::tryParse(query));
+    EXPECT_FALSE(Parser::parse(query));
 }

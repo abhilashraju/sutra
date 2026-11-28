@@ -14,12 +14,15 @@ Task<void> echoSession(TcpConnection conn)
 {
     for (;;)
     {
-        std::string data = co_await conn.readSome();
-        if (data.empty())
+        auto data = co_await conn.readSome();
+        if (!data || data->empty())
         {
             break;
         }
-        co_await conn.write(data);
+        if (!co_await conn.write(*data))
+        {
+            break;
+        }
     }
 }
 
@@ -29,7 +32,7 @@ TEST(Tcp, EchoRoundTrip)
 {
     net::io_context ioc;
     TcpServer server(ioc.get_executor(), "127.0.0.1", 0, echoSession);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     std::string reply1;
@@ -40,10 +43,10 @@ TEST(Tcp, EchoRoundTrip)
         TcpClient client(ioc.get_executor());
         client.setConnectTimeout(5s);
         client.setTimeout(5s);
-        co_await client.connect("127.0.0.1", port);
-        co_await client.write("hello\nworld\n");
-        reply1 = co_await client.readUntil("\n");
-        reply2 = co_await client.readUntil("\n");
+        EXPECT_TRUE(co_await client.connect("127.0.0.1", port));
+        EXPECT_TRUE(co_await client.write("hello\nworld\n"));
+        reply1 = (co_await client.readUntil("\n")).value_or("");
+        reply2 = (co_await client.readUntil("\n")).value_or("");
         client.close();
         server.stop();
     };
@@ -57,32 +60,67 @@ TEST(Tcp, EchoRoundTrip)
 TEST(Tcp, RefusesUnspecifiedAddress)
 {
     net::io_context ioc;
-    EXPECT_THROW(TcpServer(ioc.get_executor(), "0.0.0.0", 0,
-                           [](TcpConnection) -> Task<void> { co_return; }),
-                 std::invalid_argument);
+    TcpServer server(ioc.get_executor(), "0.0.0.0", 0,
+                     [](TcpConnection) -> Task<void> { co_return; });
+    auto started = server.start();
+    ASSERT_FALSE(started);
+    EXPECT_EQ(started.error(), make_error_code(Errc::unspecifiedAddress));
 }
 
-TEST(Tcp, ConnectFailureThrows)
+TEST(Tcp, MalformedAddressIsReportedByStart)
 {
     net::io_context ioc;
-    bool threw = false;
+    TcpServer server(ioc.get_executor(), "not-an-address", 0,
+                     [](TcpConnection) -> Task<void> { co_return; });
+    EXPECT_FALSE(server.start());
+}
+
+TEST(Tcp, ConnectFailureIsReturned)
+{
+    net::io_context ioc;
+    bool failed = false;
     exec::async_scope scope;
     auto connectTask = [&]() -> Task<void> {
         TcpClient client(ioc.get_executor());
         client.setConnectTimeout(2s);
-        try
-        {
-            // Port 1 on loopback is not listening.
-            co_await client.connect("127.0.0.1", "1");
-        }
-        catch (const system_error&)
-        {
-            threw = true;
-        }
+        // Port 1 on loopback is not listening.
+        auto connected = co_await client.connect("127.0.0.1", "1");
+        failed = !connected;
     };
     spawnTask(scope, connectTask(), "connect failure");
     ioc.run();
-    EXPECT_TRUE(threw);
+    EXPECT_TRUE(failed);
+}
+
+TEST(Tcp, ReadAfterPeerCloseIsEof)
+{
+    net::io_context ioc;
+    TcpServer server(ioc.get_executor(), "127.0.0.1", 0,
+                     [](TcpConnection conn) -> Task<void> {
+                         co_await conn.write("ab");
+                         conn.close();
+                     });
+    ASSERT_TRUE(server.start());
+    auto port = std::to_string(server.localEndpoint().port());
+
+    error_code ec;
+    exec::async_scope scope;
+    auto clientTask = [&]() -> Task<void> {
+        TcpClient client(ioc.get_executor());
+        client.setConnectTimeout(5s);
+        client.setTimeout(5s);
+        EXPECT_TRUE(co_await client.connect("127.0.0.1", port));
+        // The peer closes after two bytes: asking for more is an error value.
+        auto data = co_await client.readExactly(10);
+        if (!data)
+        {
+            ec = data.error();
+        }
+        server.stop();
+    };
+    spawnTask(scope, clientTask(), "eof client");
+    ioc.run();
+    EXPECT_EQ(ec, net::error::eof);
 }
 
 TEST(WaitQueue, NotifyWakesWaiter)

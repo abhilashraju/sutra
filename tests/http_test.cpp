@@ -84,35 +84,53 @@ TEST(Http, RoutesKeepAliveAndErrors)
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
                       router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     runClient(ioc, server, [&]() -> Task<void> {
         HttpClient client(ioc.get_executor());
         client.setTimeout(5s);
-        co_await client.connect("127.0.0.1", port);
+        EXPECT_TRUE(co_await client.connect("127.0.0.1", port));
 
         // Several requests over one connection.
         auto r1 = co_await client.send(get("/hello"));
-        EXPECT_EQ(r1.result(), http::status::ok);
-        EXPECT_EQ(r1.body(), "world");
+        EXPECT_TRUE(r1);
+        if (!r1)
+        {
+            co_return;
+        }
+        EXPECT_EQ(r1->result(), http::status::ok);
+        EXPECT_EQ(r1->body(), "world");
 
         auto r2 = co_await client.send(get("/items/42?q=a%20b&x=1"));
-        EXPECT_EQ(r2.body(), "42:a b");
+        EXPECT_TRUE(r2);
+        EXPECT_EQ(r2 ? r2->body() : "", "42:a b");
 
         auto r3 = co_await client.send(post("/echo", R"({"a":1})"));
-        EXPECT_EQ(r3.body(), R"({"a":1})");
-        EXPECT_EQ(r3[http::field::content_type], "application/json");
+        EXPECT_TRUE(r3);
+        if (r3)
+        {
+            EXPECT_EQ(r3->body(), R"({"a":1})");
+            EXPECT_EQ((*r3)[http::field::content_type], "application/json");
+        }
 
         auto r4 = co_await client.send(get("/missing"));
-        EXPECT_EQ(r4.result(), http::status::not_found);
+        EXPECT_TRUE(r4);
+        EXPECT_EQ(r4 ? r4->result() : http::status::unknown,
+                  http::status::not_found);
 
         auto r5 = co_await client.send(post("/hello", "x"));
-        EXPECT_EQ(r5.result(), http::status::method_not_allowed);
+        EXPECT_TRUE(r5);
+        EXPECT_EQ(r5 ? r5->result() : http::status::unknown,
+                  http::status::method_not_allowed);
 
         auto r6 = co_await client.send(get("/boom"));
-        EXPECT_EQ(r6.result(), http::status::internal_server_error);
-        EXPECT_EQ(r6.body().find("exploded"), std::string::npos);
+        EXPECT_TRUE(r6);
+        if (r6)
+        {
+            EXPECT_EQ(r6->result(), http::status::internal_server_error);
+            EXPECT_EQ(r6->body().find("exploded"), std::string::npos);
+        }
     });
 }
 
@@ -125,15 +143,17 @@ TEST(Http, RejectsOversizedBody)
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
                       router, options);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     runClient(ioc, server, [&]() -> Task<void> {
         HttpClient client(ioc.get_executor());
         client.setTimeout(5s);
-        co_await client.connect("127.0.0.1", port);
+        EXPECT_TRUE(co_await client.connect("127.0.0.1", port));
         auto res = co_await client.send(post("/echo", std::string(1024, 'x')));
-        EXPECT_EQ(res.result(), http::status::payload_too_large);
+        EXPECT_TRUE(res);
+        EXPECT_EQ(res ? res->result() : http::status::unknown,
+                  http::status::payload_too_large);
     });
 }
 
@@ -144,20 +164,21 @@ TEST(Http, ServerSentEvents)
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
                       router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     std::vector<std::string> events;
     runClient(ioc, server, [&]() -> Task<void> {
         HttpClient client(ioc.get_executor());
         client.setTimeout(5s);
-        co_await client.connect("127.0.0.1", port);
+        EXPECT_TRUE(co_await client.connect("127.0.0.1", port));
         auto status =
             co_await client.subscribe(get("/events"), [&](std::string data) {
                 events.push_back(data);
                 return true;
             });
-        EXPECT_EQ(status, http::status::ok);
+        EXPECT_TRUE(status);
+        EXPECT_EQ(status.value_or(http::status::unknown), http::status::ok);
     });
     EXPECT_EQ(events, (std::vector<std::string>{"tick 0", "tick 1", "tick 2"}));
 }
@@ -166,24 +187,29 @@ TEST(Https, VerifiedRoundTrip)
 {
     net::io_context ioc;
     auto pem = generateSelfSignedCertificate("localhost");
-    auto serverContext = makeServerContext(pem.certificate, pem.privateKey);
-    auto clientContext = makeClientContext(pem.certificate);
+    ASSERT_TRUE(pem);
+    auto serverContext = makeServerContext(pem->certificate, pem->privateKey);
+    auto clientContext = makeClientContext(pem->certificate);
+    ASSERT_TRUE(serverContext);
+    ASSERT_TRUE(clientContext);
 
     auto router = makeRouter();
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
-                      router, serverContext);
-    server.start();
+                      router, *serverContext);
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     runClient(ioc, server, [&]() -> Task<void> {
-        HttpsClient client(ioc.get_executor(), &clientContext);
+        HttpsClient client(ioc.get_executor(), &*clientContext);
         client.setTimeout(5s);
-        co_await client.connect("localhost", port);
+        EXPECT_TRUE(co_await client.connect("localhost", port));
         auto res = co_await client.send(get("/hello"));
-        EXPECT_EQ(res.body(), "world");
+        EXPECT_TRUE(res);
+        EXPECT_EQ(res ? res->body() : "", "world");
         auto res2 = co_await client.send(get("/items/7"));
-        EXPECT_EQ(res2.body(), "7:");
+        EXPECT_TRUE(res2);
+        EXPECT_EQ(res2 ? res2->body() : "", "7:");
     });
 }
 
@@ -191,30 +217,29 @@ TEST(Https, UntrustedCertificateIsRejected)
 {
     net::io_context ioc;
     auto pem = generateSelfSignedCertificate("localhost");
-    auto serverContext = makeServerContext(pem.certificate, pem.privateKey);
     auto other = generateSelfSignedCertificate("localhost");
-    auto clientContext = makeClientContext(other.certificate);
+    ASSERT_TRUE(pem);
+    ASSERT_TRUE(other);
+    auto serverContext = makeServerContext(pem->certificate, pem->privateKey);
+    auto clientContext = makeClientContext(other->certificate);
+    ASSERT_TRUE(serverContext);
+    ASSERT_TRUE(clientContext);
 
     auto router = makeRouter();
     HttpServer server(ioc.get_executor(),
                       tcp::endpoint(net::ip::make_address("127.0.0.1"), 0),
-                      router, serverContext);
-    server.start();
+                      router, *serverContext);
+    ASSERT_TRUE(server.start());
     auto port = std::to_string(server.localEndpoint().port());
 
     bool rejected = false;
     exec::async_scope scope;
     auto task = [&]() -> Task<void> {
-        HttpsClient client(ioc.get_executor(), &clientContext);
+        HttpsClient client(ioc.get_executor(), &*clientContext);
         client.setTimeout(5s);
-        try
-        {
-            co_await client.connect("localhost", port);
-        }
-        catch (const system_error&)
-        {
-            rejected = true;
-        }
+        auto connected = co_await client.connect("localhost", port);
+        rejected = !connected && connected.error().category() ==
+                                     net::error::get_ssl_category();
         server.stop();
     };
     spawnTask(scope, task(), "untrusted client");

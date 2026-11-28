@@ -9,6 +9,7 @@
 
 #include "sutra/config.hpp"
 #include "sutra/connection.hpp"
+#include "sutra/log.hpp"
 #include "sutra/tcp_client.hpp"
 
 #include <openssl/x509.h>
@@ -99,9 +100,13 @@ class HttpClientT : public Connection<Stream>
      *        `tlsServerName` when that is not empty. An explicit
      *        `tlsServerName` also accepts a certificate that has no DNS/IP
      *        SAN and whose subject CN equals it.
+     * @return success or the failure. When a certificate is rejected the
+     *         code is the TLS error and the reason (OpenSSL's, or the name
+     *         that did not match) is logged as a warning.
      */
-    Task<void> connect(std::string host, std::string port,
-                       [[maybe_unused]] std::string tlsServerName = {})
+    Task<Expected<void>> connect(
+        std::string host, std::string port,
+        [[maybe_unused]] std::string tlsServerName = {})
     {
         auto verifyFailure = std::make_shared<std::string>();
         if constexpr (isTls)
@@ -112,32 +117,35 @@ class HttpClientT : public Connection<Stream>
             if (!SSL_set_tlsext_host_name(this->stream().native_handle(),
                                           name.c_str()))
             {
-                throw system_error(
+                co_return std::unexpected(
                     error_code(static_cast<int>(::ERR_get_error()),
                                net::error::get_ssl_category()));
             }
             this->stream().set_verify_callback(verifyAndRecordReason(
                 name, verifyFailure, !tlsServerName.empty()));
         }
-        co_await connectStream(*this, executor, host, std::move(port),
-                               connectTimeout);
+        auto connected = co_await connectStream(
+            *this, executor, host, std::move(port), connectTimeout);
+        if (!connected)
+        {
+            co_return std::unexpected(connected.error());
+        }
         if constexpr (isTls)
         {
-            try
+            auto shaken = co_await this->handshake(ssl::stream_base::client,
+                                                   connectTimeout);
+            if (!shaken)
             {
-                co_await this->handshake(ssl::stream_base::client,
-                                         connectTimeout);
-            }
-            catch (const system_error& e)
-            {
-                if (verifyFailure->empty())
+                if (!verifyFailure->empty())
                 {
-                    throw;
+                    logWarning("tls handshake with {} failed: {}", host,
+                               *verifyFailure);
                 }
-                throw system_error(e.code(), *verifyFailure);
+                co_return std::unexpected(shaken.error());
             }
         }
         peerHost = std::move(host);
+        co_return Expected<void>();
     }
 
     /**
@@ -145,34 +153,48 @@ class HttpClientT : public Connection<Stream>
      *
      * Adds `Host` when missing and prepares the payload. The connection stays
      * usable afterwards only when `response.keep_alive()` is true.
+     * @return the response, or the transport/protocol failure.
      */
-    Task<HttpResponse> send(HttpRequest req)
+    Task<Expected<HttpResponse>> send(HttpRequest req)
     {
         prepare(req);
-        co_await this->run([&](auto token) {
+        auto written = co_await this->run([&](auto token) {
             return http::async_write(this->stream(), req, token);
         });
+        if (!written)
+        {
+            co_return std::unexpected(written.error());
+        }
         http::response_parser<http::string_body> parser;
         parser.body_limit(maxBodyBytes);
-        co_await this->run([&](auto token) {
+        auto read = co_await this->run([&](auto token) {
             return http::async_read(this->stream(), this->buffer(), parser,
                                     token);
         });
+        if (!read)
+        {
+            co_return std::unexpected(read.error());
+        }
         co_return parser.release();
     }
 
     /**
      * @brief Sends `req`, then delivers server-sent events to `onEvent` until
      *        it returns false or the stream ends.
-     * @return the response status.
+     * @return the response status, or the failure.
      */
-    Task<http::status> subscribe(HttpRequest req, EventHandler onEvent)
+    Task<Expected<http::status>> subscribe(HttpRequest req,
+                                           EventHandler onEvent)
     {
         prepare(req);
         req.set(http::field::accept, "text/event-stream");
-        co_await this->run([&](auto token) {
+        auto written = co_await this->run([&](auto token) {
             return http::async_write(this->stream(), req, token);
         });
+        if (!written)
+        {
+            co_return std::unexpected(written.error());
+        }
 
         http::response_parser<http::string_body> parser;
         parser.body_limit(boost::none);
@@ -190,16 +212,24 @@ class HttpClientT : public Connection<Stream>
         };
         parser.on_chunk_body(onChunk);
 
-        co_await this->run([&](auto token) {
+        auto header = co_await this->run([&](auto token) {
             return http::async_read_header(this->stream(), this->buffer(),
                                            parser, token);
         });
+        if (!header)
+        {
+            co_return std::unexpected(header.error());
+        }
         while (!parser.is_done() && !stop)
         {
-            co_await this->run([&](auto token) {
+            auto chunk = co_await this->run([&](auto token) {
                 return http::async_read_some(this->stream(), this->buffer(),
                                              parser, token);
             });
+            if (!chunk)
+            {
+                co_return std::unexpected(chunk.error());
+            }
         }
         co_return parser.get().result();
     }

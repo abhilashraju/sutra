@@ -77,7 +77,8 @@ inline nlohmann::json initialVariables(const Operation& operation)
 // fragmentSpreadName is non-empty) into the actual fields from the fragment
 // registry.  Inline fragments are already expanded by the parser.
 // `visited` guards against circular fragment references.
-inline void expandFragments(
+// Fails for a circular or unknown fragment reference.
+inline Result<void> expandFragments(
     std::vector<FieldSelection>& selections,
     const std::unordered_map<std::string, FragmentDefinition>& fragments,
     std::unordered_set<std::string>& visited)
@@ -94,19 +95,23 @@ inline void expandFragments(
             const std::string& fragName = sel.fragmentSpreadName;
             if (visited.count(fragName) != 0)
             {
-                throw std::runtime_error(
+                return std::unexpected(
                     "Circular fragment reference: " + fragName);
             }
             auto it = fragments.find(fragName);
             if (it == fragments.end())
             {
-                throw std::runtime_error("Unknown fragment: " + fragName);
+                return std::unexpected("Unknown fragment: " + fragName);
             }
             // Work on a copy so the stored definition stays pristine.
             auto fragFields = it->second.selections;
             visited.insert(fragName);
-            expandFragments(fragFields, fragments, visited);
+            auto nested = expandFragments(fragFields, fragments, visited);
             visited.erase(fragName);
+            if (!nested)
+            {
+                return nested;
+            }
             for (auto& f : fragFields)
             {
                 expanded.push_back(std::move(f));
@@ -115,19 +120,24 @@ inline void expandFragments(
         else
         {
             // Ordinary field — recurse into its own sub-selections.
-            expandFragments(sel.selections, fragments, visited);
+            auto nested = expandFragments(sel.selections, fragments, visited);
+            if (!nested)
+            {
+                return nested;
+            }
             expanded.push_back(std::move(sel));
         }
     }
 
     selections = std::move(expanded);
+    return {};
 }
 
 // Convenience overload — no external visited set needed.
-inline void expandFragments(Operation& operation)
+inline Result<void> expandFragments(Operation& operation)
 {
     std::unordered_set<std::string> visited;
-    expandFragments(operation.selections, operation.fragments, visited);
+    return expandFragments(operation.selections, operation.fragments, visited);
 }
 
 inline nlohmann::json filterFields(

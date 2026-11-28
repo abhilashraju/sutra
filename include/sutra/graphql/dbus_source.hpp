@@ -85,30 +85,26 @@ class SutraDbusBackend : public DbusBackend
         std::string path, int depth,
         std::vector<std::string> interfaces) override
     {
-        try
+        auto tree = co_await sutra::getSubTree(*connection, std::move(path),
+                                               depth, std::move(interfaces));
+        if (!tree)
         {
-            co_return co_await sutra::getSubTree(*connection, std::move(path),
-                                                 depth, std::move(interfaces));
+            co_return std::unexpected(tree.error().message());
         }
-        catch (const std::system_error& e)
-        {
-            co_return std::unexpected(e.code().message());
-        }
+        co_return std::move(*tree);
     }
 
     Task<Result<DbusPropertyMap>> getAll(std::string service, std::string path,
                                          std::string interface) override
     {
-        try
+        auto props = co_await sutra::getAllProperties(
+            *connection, std::move(service), std::move(path),
+            std::move(interface));
+        if (!props)
         {
-            co_return co_await sutra::getAllProperties(
-                *connection, std::move(service), std::move(path),
-                std::move(interface));
+            co_return std::unexpected(props.error().message());
         }
-        catch (const std::system_error& e)
-        {
-            co_return std::unexpected(e.code().message());
-        }
+        co_return std::move(*props);
     }
 
   private:

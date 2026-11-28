@@ -18,12 +18,21 @@ constexpr auto testService = "com.sutra.TestService";
 constexpr auto testPath = "/com/sutra/test/obj1";
 constexpr auto testInterface = "com.sutra.Test";
 
+/** Connects to the session bus; owns `name` when one is given. */
 std::shared_ptr<sdbusplus::asio::connection> connect(net::io_context& ioc,
-                                                     const char* name)
+                                                     const char* name = nullptr)
 {
     auto conn = makeConnection(ioc, true);
-    conn->request_name(name);
-    return conn;
+    EXPECT_TRUE(conn);
+    if (!conn)
+    {
+        std::abort();
+    }
+    if (name != nullptr)
+    {
+        (*conn)->request_name(name);
+    }
+    return *conn;
 }
 
 /** The service the tests talk to. */
@@ -126,7 +135,7 @@ void runWithBus(Body body)
     net::io_context ioc;
     TestService service(ioc);
     MapperStub mapper(ioc);
-    auto clientPtr = makeConnection(ioc, true);
+    auto clientPtr = connect(ioc);
     auto& client = *clientPtr;
 
     exec::async_scope scope;
@@ -148,16 +157,14 @@ void runWithBus(Body body)
     EXPECT_FALSE(failed);
 }
 
+/** The error of a failed call; a default (success) code when it worked. */
 template <class Awaited>
 Task<error_code> failureOf(Awaited&& call)
 {
-    try
+    auto result = co_await std::forward<Awaited>(call);
+    if (!result)
     {
-        co_await std::forward<Awaited>(call);
-    }
-    catch (const system_error& e)
-    {
-        co_return e.code();
+        co_return result.error();
     }
     co_return error_code{};
 }
@@ -169,19 +176,22 @@ TEST(DBus, GetAndSetProperty)
     runWithBus([](sdbusplus::asio::connection& bus) -> Task<void> {
         auto name = co_await getProperty<std::string>(
             bus, testService, testPath, testInterface, "Name");
-        EXPECT_EQ(name, "alpha");
+        EXPECT_TRUE(name);
+        EXPECT_EQ(name.value_or(""), "alpha");
 
-        co_await setProperty<std::string>(bus, testService, testPath,
-                                          testInterface, "Name", "beta");
+        auto set = co_await setProperty<std::string>(
+            bus, testService, testPath, testInterface, "Name", "beta");
+        EXPECT_TRUE(set);
         name = co_await getProperty<std::string>(bus, testService, testPath,
                                                  testInterface, "Name");
-        EXPECT_EQ(name, "beta");
+        EXPECT_EQ(name.value_or(""), "beta");
 
-        co_await setProperty<uint32_t>(bus, testService, testPath,
-                                       testInterface, "Count", 99);
+        set = co_await setProperty<uint32_t>(bus, testService, testPath,
+                                             testInterface, "Count", 99);
+        EXPECT_TRUE(set);
         auto count = co_await getProperty<uint32_t>(bus, testService, testPath,
                                                     testInterface, "Count");
-        EXPECT_EQ(count, 99u);
+        EXPECT_EQ(count.value_or(0), 99u);
     });
 }
 
@@ -216,19 +226,37 @@ TEST(DBus, PropertyErrors)
 TEST(DBus, GetAllProperties)
 {
     runWithBus([](sdbusplus::asio::connection& bus) -> Task<void> {
-        auto props = co_await getAllProperties(bus, testService, testPath,
-                                               testInterface);
+        auto all = co_await getAllProperties(bus, testService, testPath,
+                                             testInterface);
+        EXPECT_TRUE(all);
+        if (!all)
+        {
+            co_return;
+        }
+        const auto& props = *all;
         EXPECT_EQ(props.size(), 3u);
-        auto [name, count, enabled] =
-            getPropertiesFromMap<std::string, uint32_t, bool>(
-                props, "Name", "Count", "Enabled");
-        EXPECT_EQ(name, "alpha");
-        EXPECT_EQ(count, 7u);
-        EXPECT_TRUE(enabled);
+        auto values = getPropertiesFromMap<std::string, uint32_t, bool>(
+            props, "Name", "Count", "Enabled");
+        EXPECT_TRUE(values);
+        if (values)
+        {
+            auto [name, count, enabled] = *values;
+            EXPECT_EQ(name, "alpha");
+            EXPECT_EQ(count, 7u);
+            EXPECT_TRUE(enabled);
+        }
 
-        EXPECT_THROW((getPropertyFromMap<bool>(props, "Missing")),
-                     system_error);
-        EXPECT_THROW((getPropertyFromMap<bool>(props, "Name")), system_error);
+        auto missing = getPropertyFromMap<bool>(props, "Missing");
+        EXPECT_FALSE(missing);
+        EXPECT_EQ(missing.error(), net::error::not_found);
+        auto wrongType = getPropertyFromMap<bool>(props, "Name");
+        EXPECT_FALSE(wrongType);
+        EXPECT_EQ(wrongType.error(), net::error::invalid_argument);
+
+        auto mixed =
+            getPropertiesFromMap<std::string, bool>(props, "Name", "Missing");
+        EXPECT_FALSE(mixed);
+        EXPECT_EQ(mixed.error(), net::error::not_found);
     });
 }
 
@@ -238,18 +266,24 @@ TEST(DBus, MethodCalls)
         auto sum = co_await dbusMethodCall<int32_t>(
             bus, testService, testPath, testInterface, "Add", int32_t(2),
             int32_t(40));
-        EXPECT_EQ(sum, 42);
+        EXPECT_TRUE(sum);
+        EXPECT_EQ(sum.value_or(-1), 42);
 
         // The service returns a std::tuple, which sdbusplus sends as one
         // D-Bus struct.
         auto both = co_await dbusMethodCall<std::tuple<std::string, uint32_t>>(
             bus, testService, testPath, testInterface, "Describe",
             std::string("abc"));
-        EXPECT_EQ(std::get<0>(both), "<abc>");
-        EXPECT_EQ(std::get<1>(both), 3u);
+        EXPECT_TRUE(both);
+        if (both)
+        {
+            EXPECT_EQ(std::get<0>(*both), "<abc>");
+            EXPECT_EQ(std::get<1>(*both), 3u);
+        }
 
-        co_await dbusMethodCall<>(bus, testService, testPath, testInterface,
-                                  "Ping");
+        auto ping = co_await dbusMethodCall<>(bus, testService, testPath,
+                                              testInterface, "Ping");
+        EXPECT_TRUE(ping);
 
         auto ec = co_await failureOf(dbusMethodCall<>(
             bus, testService, testPath, testInterface, "Fail"));
@@ -269,9 +303,10 @@ TEST(DBus, ConcurrentCalls)
         std::vector<int32_t> results(8, -1);
         exec::async_scope scope;
         auto worker = [&](int index) -> Task<void> {
-            results[index] = co_await dbusMethodCall<int32_t>(
+            auto sum = co_await dbusMethodCall<int32_t>(
                 bus, testService, testPath, testInterface, "Add",
                 int32_t(index), int32_t(100));
+            results[index] = sum.value_or(-1);
         };
         for (int i = 0; i < 8; ++i)
         {
@@ -289,27 +324,34 @@ TEST(DBus, ObjectMapperCalls)
 {
     runWithBus([](sdbusplus::asio::connection& bus) -> Task<void> {
         auto tree = co_await getSubTree(bus, "/com/sutra", 0, {testInterface});
-        EXPECT_EQ(tree.size(), 1u);
-        if (tree.empty())
+        EXPECT_TRUE(tree);
+        if (!tree || tree->empty())
         {
+            ADD_FAILURE() << "expected one subtree entry";
             co_return;
         }
-        EXPECT_EQ(tree.begin()->first, testPath);
-        EXPECT_EQ(tree.begin()->second.begin()->first, testService);
+        EXPECT_EQ(tree->size(), 1u);
+        EXPECT_EQ(tree->begin()->first, testPath);
+        EXPECT_EQ(tree->begin()->second.begin()->first, testService);
 
         tree = co_await getSubTree(bus, "/com/sutra", 0, {"no.such.Iface"});
-        EXPECT_TRUE(tree.empty());
+        EXPECT_TRUE(tree);
+        EXPECT_TRUE(tree && tree->empty());
 
         auto paths = co_await getSubTreePaths(bus, "/", 0);
-        EXPECT_EQ(paths, std::vector<std::string>{testPath});
+        EXPECT_TRUE(paths);
+        EXPECT_EQ(paths.value_or(std::vector<std::string>{}),
+                  std::vector<std::string>{testPath});
 
         auto objects = co_await getObjects(bus, testPath);
-        EXPECT_EQ(objects.size(), 1u);
-        if (objects.empty())
+        EXPECT_TRUE(objects);
+        if (!objects || objects->empty())
         {
+            ADD_FAILURE() << "expected one object entry";
             co_return;
         }
-        EXPECT_EQ(objects.begin()->first, testService);
+        EXPECT_EQ(objects->size(), 1u);
+        EXPECT_EQ(objects->begin()->first, testService);
 
         auto ec = co_await failureOf(getObjects(bus, "/not/there"));
         EXPECT_TRUE(ec);
@@ -324,17 +366,28 @@ TEST(DBus, ManagedObjectsAndIntrospection)
 {
     runWithBus([](sdbusplus::asio::connection& bus) -> Task<void> {
         auto managed = co_await getManagedObjects(bus, testService, "/");
-        auto it = managed.find(ObjectPath(testPath));
-        EXPECT_NE(it, managed.end());
-        if (it == managed.end())
+        EXPECT_TRUE(managed);
+        if (!managed)
+        {
+            co_return;
+        }
+        auto it = managed->find(ObjectPath(testPath));
+        EXPECT_NE(it, managed->end());
+        if (it == managed->end())
         {
             co_return;
         }
         const auto& props = it->second.at(testInterface);
-        EXPECT_EQ(getPropertyFromMap<std::string>(props, "Name"), "alpha");
+        auto name = getPropertyFromMap<std::string>(props, "Name");
+        EXPECT_EQ(name.value_or(""), "alpha");
 
         auto xml = co_await introspect(bus, testService, testPath);
-        EXPECT_NE(xml.find(testInterface), std::string::npos);
-        EXPECT_NE(xml.find("Add"), std::string::npos);
+        EXPECT_TRUE(xml);
+        if (!xml)
+        {
+            co_return;
+        }
+        EXPECT_NE(xml->find(testInterface), std::string::npos);
+        EXPECT_NE(xml->find("Add"), std::string::npos);
     });
 }

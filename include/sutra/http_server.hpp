@@ -62,9 +62,10 @@ class HttpServer
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    void start()
+    /** @brief Binds and begins accepting; see TcpServer::start(). */
+    Expected<void> start()
     {
-        listener.start();
+        return listener.start();
     }
 
     void stop()
@@ -89,11 +90,12 @@ class HttpServer
         }
         TlsConnection tls(
             ssl::stream<tcp::socket>(std::move(plain.stream()), *tlsContext));
-        if (auto ec = co_await tls.tryHandshake(ssl::stream_base::server,
-                                                options.handshakeTimeout))
+        if (auto shaken = co_await tls.handshake(ssl::stream_base::server,
+                                                 options.handshakeTimeout);
+            !shaken)
         {
             logDebug("tls handshake with {} failed: {}",
-                     remote.address().to_string(), ec.message());
+                     remote.address().to_string(), shaken.error().message());
             co_return;
         }
         co_await serve(tls, remote);
@@ -111,13 +113,14 @@ class HttpServer
     Task<ReadOutcome> readRequest(Connection<Stream>& conn,
                                   http::request_parser<http::string_body>& p)
     {
-        const auto code = co_await conn.tryRun([&](auto token) {
+        const auto read = co_await conn.run([&](auto token) {
             return http::async_read(conn.stream(), conn.buffer(), p, token);
         });
-        if (!code)
+        if (read)
         {
             co_return ReadOutcome::request;
         }
+        const auto code = read.error();
         if (code == http::error::body_limit)
         {
             co_return ReadOutcome::tooLarge;
@@ -198,14 +201,14 @@ class HttpServer
     template <class Stream>
     static Task<bool> send(Connection<Stream>& conn, HttpResponse& res)
     {
-        const auto ec = co_await conn.tryRun([&](auto token) {
+        const auto written = co_await conn.run([&](auto token) {
             return http::async_write(conn.stream(), res, token);
         });
-        if (ec)
+        if (!written)
         {
-            logDebug("response write failed: {}", ec.message());
+            logDebug("response write failed: {}", written.error().message());
         }
-        co_return !ec;
+        co_return written.has_value();
     }
 
     template <class Stream>
@@ -219,7 +222,7 @@ class HttpServer
             "Cache-Control: no-cache\r\n"
             "Transfer-Encoding: chunked\r\n"
             "Connection: close\r\n\r\n";
-        if (co_await conn.tryWrite(head))
+        if (!co_await conn.write(head))
         {
             co_return;
         }
@@ -244,7 +247,8 @@ class HttpServer
             std::string chunk = std::format("{:x}\r\n", frame.size());
             chunk += frame;
             chunk += "\r\n";
-            co_return !co_await conn.tryWrite(chunk);
+            auto written = co_await conn.write(chunk);
+            co_return written.has_value();
         });
 
         try
@@ -255,7 +259,7 @@ class HttpServer
         {
             logDebug("sse handler for {} ended: {}", ctx.path, e.what());
         }
-        co_await conn.tryWrite("0\r\n\r\n");
+        co_await conn.write("0\r\n\r\n");
         co_await conn.gracefulClose();
     }
 

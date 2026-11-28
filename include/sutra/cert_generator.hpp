@@ -5,6 +5,10 @@
  * The generator is meant for tests, examples and first-boot bootstrap. The TLS
  * context helpers always enforce TLS 1.2+ and, on the client side, peer
  * certificate verification (there is deliberately no way to switch it off).
+ *
+ * Every function returns `Expected<T>`. An OpenSSL failure carries the
+ * OpenSSL error code (in the `ssl` category) when the library reported one,
+ * and `Errc::opensslFailure` otherwise.
  */
 #pragma once
 
@@ -12,6 +16,7 @@
 
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -19,7 +24,6 @@
 
 #include <filesystem>
 #include <memory>
-#include <stdexcept>
 #include <string>
 
 namespace sutra
@@ -41,9 +45,15 @@ inline std::string pemOf(BIO* bio)
     return std::string(data, static_cast<size_t>(length));
 }
 
-[[noreturn]] inline void opensslFailure(const char* what)
+/** @brief The pending OpenSSL error, or `Errc::opensslFailure`. */
+inline error_code opensslError()
 {
-    throw std::runtime_error(std::string("openssl: ") + what);
+    if (auto code = ::ERR_get_error(); code != 0)
+    {
+        return error_code(static_cast<int>(code),
+                          net::error::get_ssl_category());
+    }
+    return make_error_code(Errc::opensslFailure);
 }
 
 } // namespace details
@@ -55,7 +65,7 @@ inline std::string pemOf(BIO* bio)
  * "DNS:localhost,IP:127.0.0.1".
  * @param validDays          lifetime in days.
  */
-inline PemPair generateSelfSignedCertificate(
+inline Expected<PemPair> generateSelfSignedCertificate(
     const std::string& commonName,
     const std::string& subjectAltNames = "DNS:localhost,IP:127.0.0.1",
     int validDays = 1)
@@ -64,12 +74,12 @@ inline PemPair generateSelfSignedCertificate(
         EVP_EC_gen("P-256"), EVP_PKEY_free);
     if (!key)
     {
-        details::opensslFailure("key generation failed");
+        return std::unexpected(details::opensslError());
     }
     std::unique_ptr<X509, decltype(&X509_free)> cert(X509_new(), X509_free);
     if (!cert)
     {
-        details::opensslFailure("X509_new failed");
+        return std::unexpected(details::opensslError());
     }
 
     X509_set_version(cert.get(), 2);
@@ -79,7 +89,7 @@ inline PemPair generateSelfSignedCertificate(
         BN_to_ASN1_INTEGER(serial.get(), X509_get_serialNumber(cert.get())) ==
             nullptr)
     {
-        details::opensslFailure("serial generation failed");
+        return std::unexpected(details::opensslError());
     }
     X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
     X509_gmtime_adj(X509_getm_notAfter(cert.get()),
@@ -98,7 +108,7 @@ inline PemPair generateSelfSignedCertificate(
         X509_set_subject_name(cert.get(), name.get()) != 1 ||
         X509_set_issuer_name(cert.get(), name.get()) != 1)
     {
-        details::opensslFailure("subject name failed");
+        return std::unexpected(details::opensslError());
     }
 
     X509V3_CTX v3;
@@ -109,12 +119,12 @@ inline PemPair generateSelfSignedCertificate(
         X509_EXTENSION_free);
     if (!san || X509_add_ext(cert.get(), san.get(), -1) != 1)
     {
-        details::opensslFailure("subjectAltName failed");
+        return std::unexpected(details::opensslError());
     }
 
     if (X509_sign(cert.get(), key.get(), EVP_sha256()) == 0)
     {
-        details::opensslFailure("signing failed");
+        return std::unexpected(details::opensslError());
     }
 
     std::unique_ptr<BIO, decltype(&BIO_free_all)> certBio(
@@ -126,24 +136,38 @@ inline PemPair generateSelfSignedCertificate(
         PEM_write_bio_PrivateKey(keyBio.get(), key.get(), nullptr, nullptr, 0,
                                  nullptr, nullptr) != 1)
     {
-        details::opensslFailure("PEM encoding failed");
+        return std::unexpected(details::opensslError());
     }
-    return {details::pemOf(certBio.get()), details::pemOf(keyBio.get())};
+    return PemPair{details::pemOf(certBio.get()), details::pemOf(keyBio.get())};
 }
 
 /** @brief TLS 1.2+ server context from PEM strings. */
-inline ssl::context makeServerContext(const std::string& certificatePem,
-                                      const std::string& privateKeyPem)
+inline Expected<ssl::context> makeServerContext(
+    const std::string& certificatePem, const std::string& privateKeyPem)
 {
     ssl::context ctx(ssl::context::tls_server);
+    error_code ec;
     ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 |
-                    ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
-                    ssl::context::no_tlsv1_1 | ssl::context::single_dh_use);
+                        ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
+                        ssl::context::no_tlsv1_1 | ssl::context::single_dh_use,
+                    ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION);
     ctx.use_certificate_chain(
-        net::buffer(certificatePem.data(), certificatePem.size()));
+        net::buffer(certificatePem.data(), certificatePem.size()), ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     ctx.use_private_key(net::buffer(privateKeyPem.data(), privateKeyPem.size()),
-                        ssl::context::pem);
+                        ssl::context::pem, ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     return ctx;
 }
 
@@ -152,22 +176,37 @@ inline ssl::context makeServerContext(const std::string& certificatePem,
  * @param trustedPem extra trust anchor (PEM). When empty the system store is
  *                   used.
  */
-inline ssl::context makeClientContext(const std::string& trustedPem = {})
+inline Expected<ssl::context> makeClientContext(
+    const std::string& trustedPem = {})
 {
     ssl::context ctx(ssl::context::tls_client);
+    error_code ec;
     ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 |
-                    ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
-                    ssl::context::no_tlsv1_1);
+                        ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
+                        ssl::context::no_tlsv1_1,
+                    ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION);
-    ctx.set_verify_mode(ssl::verify_peer);
+    ctx.set_verify_mode(ssl::verify_peer, ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     if (trustedPem.empty())
     {
-        ctx.set_default_verify_paths();
+        ctx.set_default_verify_paths(ec);
     }
     else
     {
         ctx.add_certificate_authority(
-            net::buffer(trustedPem.data(), trustedPem.size()));
+            net::buffer(trustedPem.data(), trustedPem.size()), ec);
+    }
+    if (ec)
+    {
+        return std::unexpected(ec);
     }
     return ctx;
 }
@@ -181,41 +220,56 @@ inline ssl::context makeClientContext(const std::string& trustedPem = {})
  *               server for mutual TLS. Must be given together with
  *               `clientKeyPath`.
  * @param clientKeyPath optional PEM private key for `clientCertPath`.
- * @throws std::runtime_error when `caPath` is not a directory, only one of the
- *         client cert/key is given, or the client cert/key cannot be loaded or
- *         do not match.
+ * @return the context, `Errc::incompleteClientCredentials` when only one of
+ *         the client cert/key is given, `Errc::invalidCaPath` when `caPath` is
+ *         not a directory, or the failure to load the client cert/key (also
+ *         when they do not match).
  */
-inline ssl::context makeClientContextWithCaPath(
+inline Expected<ssl::context> makeClientContextWithCaPath(
     const std::string& caPath, const std::string& clientCertPath = {},
     const std::string& clientKeyPath = {})
 {
     if (clientCertPath.empty() != clientKeyPath.empty())
     {
-        throw std::runtime_error(
-            "client certificate and key must be given together");
+        return std::unexpected(
+            make_error_code(Errc::incompleteClientCredentials));
     }
-    if (!std::filesystem::is_directory(caPath))
+    error_code ec;
+    if (!std::filesystem::is_directory(caPath, ec))
     {
-        throw std::runtime_error("CA path '" + caPath + "' is not a directory");
+        return std::unexpected(make_error_code(Errc::invalidCaPath));
     }
     ssl::context ctx(ssl::context::tls_client);
     ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 |
-                    ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
-                    ssl::context::no_tlsv1_1);
+                        ssl::context::no_sslv3 | ssl::context::no_tlsv1 |
+                        ssl::context::no_tlsv1_1,
+                    ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION);
-    ctx.set_verify_mode(ssl::verify_peer);
-    ctx.add_verify_path(caPath);
+    ctx.set_verify_mode(ssl::verify_peer, ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
+    ctx.add_verify_path(caPath, ec);
+    if (ec)
+    {
+        return std::unexpected(ec);
+    }
     if (!clientCertPath.empty())
     {
-        try
+        ctx.use_certificate_chain_file(clientCertPath, ec);
+        if (ec)
         {
-            ctx.use_certificate_chain_file(clientCertPath);
-            ctx.use_private_key_file(clientKeyPath, ssl::context::pem);
+            return std::unexpected(ec);
         }
-        catch (const std::exception& e)
+        ctx.use_private_key_file(clientKeyPath, ssl::context::pem, ec);
+        if (ec)
         {
-            throw std::runtime_error(
-                "client certificate/key: " + std::string(e.what()));
+            return std::unexpected(ec);
         }
     }
     return ctx;

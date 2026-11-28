@@ -229,10 +229,18 @@ inline void registerGraphqlEndpoint(HttpRouter& router,
                 }
 
                 std::shared_ptr<SubscriptionTrigger> trigger;
+                auto exec = executor->getAnyExecutor();
+                if (!exec)
+                {
+                    nlohmann::json err{
+                        {"errors",
+                         nlohmann::json::array({{{"message", exec.error()}}})}};
+                    co_await writer.write(err.dump());
+                    co_return;
+                }
                 if (triggerParam == "event")
                 {
-                    auto exec = executor->getAnyExecutor();
-                    trigger = std::make_shared<EventTrigger>(exec);
+                    trigger = std::make_shared<EventTrigger>(*exec);
                 }
                 else
                 {
@@ -248,9 +256,8 @@ inline void registerGraphqlEndpoint(HttpRouter& router,
                         co_await writer.write(err.dump());
                         co_return;
                     }
-                    auto exec = executor->getAnyExecutor();
                     trigger = std::make_shared<TimerTrigger>(
-                        exec, std::chrono::seconds(*maybeInterval));
+                        *exec, std::chrono::seconds(*maybeInterval));
                 }
 
                 nlohmann::json variables;

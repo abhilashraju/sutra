@@ -78,27 +78,25 @@ HttpRouter makeRouter(net::io_context& ioc, Observed& seen)
     return router;
 }
 
+/** Fails the test and leaves the coroutine when `result` holds an error. */
+#define CO_REQUIRE_OK(result)                                                  \
+    if (!(result))                                                             \
+    {                                                                          \
+        ADD_FAILURE() << #result << ": " << (result).error().message();        \
+        co_return;                                                             \
+    }
+
 /** Runs `body` as a task, then stops `server` so ioc.run() returns. */
 template <class Server, class Body>
 void runClient(net::io_context& ioc, Server& server, Body& body)
 {
     exec::async_scope scope;
-    bool failed = false;
     auto wrapper = [&]() -> Task<void> {
-        try
-        {
-            co_await body();
-        }
-        catch (const std::exception& e)
-        {
-            ADD_FAILURE() << "client failed: " << e.what();
-            failed = true;
-        }
+        co_await body();
         server.stop();
     };
     spawnTask(scope, wrapper(), "web client test");
     ioc.run();
-    EXPECT_FALSE(failed);
 }
 
 tcp::endpoint loopback()
@@ -117,34 +115,42 @@ std::string baseUrl(const HttpServer& server, const char* scheme = "http")
 TEST(ParseUrl, SplitsParts)
 {
     auto u = parseUrl("http://example.com/a/b?x=1#frag");
-    EXPECT_FALSE(u.tls);
-    EXPECT_EQ(u.host, "example.com");
-    EXPECT_EQ(u.port, "80");
-    EXPECT_EQ(u.target, "/a/b?x=1");
+    ASSERT_TRUE(u);
+    EXPECT_FALSE(u->tls);
+    EXPECT_EQ(u->host, "example.com");
+    EXPECT_EQ(u->port, "80");
+    EXPECT_EQ(u->target, "/a/b?x=1");
 
     u = parseUrl("https://host:8443");
-    EXPECT_TRUE(u.tls);
-    EXPECT_EQ(u.port, "8443");
-    EXPECT_EQ(u.target, "/");
+    ASSERT_TRUE(u);
+    EXPECT_TRUE(u->tls);
+    EXPECT_EQ(u->port, "8443");
+    EXPECT_EQ(u->target, "/");
 
     u = parseUrl("http://[::1]:9000/p");
-    EXPECT_EQ(u.host, "::1");
-    EXPECT_EQ(u.port, "9000");
+    ASSERT_TRUE(u);
+    EXPECT_EQ(u->host, "::1");
+    EXPECT_EQ(u->port, "9000");
 
     u = parseUrl("http://h?q=1");
-    EXPECT_EQ(u.target, "/?q=1");
+    ASSERT_TRUE(u);
+    EXPECT_EQ(u->target, "/?q=1");
 }
 
 TEST(ParseUrl, RejectsBadInput)
 {
-    EXPECT_THROW(parseUrl("ftp://host/"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http:///path"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://host:0/"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://host:99999/"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://host:12ab/"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://user@host/"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://host/a b"), std::invalid_argument);
-    EXPECT_THROW(parseUrl("http://host/a\r\nX: y"), std::invalid_argument);
+    auto errorOf = [](std::string_view url) {
+        auto parsed = parseUrl(url);
+        return parsed ? error_code() : parsed.error();
+    };
+    EXPECT_EQ(errorOf("ftp://host/"), Errc::unsupportedScheme);
+    EXPECT_EQ(errorOf("http:///path"), Errc::missingHost);
+    EXPECT_EQ(errorOf("http://host:0/"), Errc::invalidUrl);
+    EXPECT_EQ(errorOf("http://host:99999/"), Errc::invalidUrl);
+    EXPECT_EQ(errorOf("http://host:12ab/"), Errc::invalidUrl);
+    EXPECT_EQ(errorOf("http://user@host/"), Errc::invalidUrl);
+    EXPECT_EQ(errorOf("http://host/a b"), Errc::invalidUrl);
+    EXPECT_EQ(errorOf("http://host/a\r\nX: y"), Errc::invalidUrl);
 }
 
 TEST(WebClient, BuildsRequests)
@@ -158,15 +164,21 @@ TEST(WebClient, BuildsRequests)
         .withJsonBody({{"k", "v"}})
         .withMethod(http::verb::post);
     auto req = client.buildRequest();
-    EXPECT_EQ(req.target(), "/base?a%20b=c%26d&z=1");
-    EXPECT_EQ(req[http::field::host], "example.com:8080");
-    EXPECT_EQ(req[http::field::content_type], "application/json");
-    EXPECT_EQ(req["X-Test"], "1");
-    EXPECT_EQ(req.body(), R"({"k":"v"})");
+    ASSERT_TRUE(req);
+    EXPECT_EQ(req->target(), "/base?a%20b=c%26d&z=1");
+    EXPECT_EQ((*req)[http::field::host], "example.com:8080");
+    EXPECT_EQ((*req)[http::field::content_type], "application/json");
+    EXPECT_EQ((*req)["X-Test"], "1");
+    EXPECT_EQ(req->body(), R"({"k":"v"})");
 
-    EXPECT_THROW(client.withHeader("Bad", "a\r\nb").buildRequest(),
-                 std::invalid_argument);
-    EXPECT_THROW(client.withUrl("https://example.com/"), std::invalid_argument);
+    auto badHeader = client.withHeader("Bad", "a\r\nb").buildRequest();
+    ASSERT_FALSE(badHeader);
+    EXPECT_EQ(badHeader.error(), Errc::invalidHeader);
+
+    // withUrl() records the failure; buildRequest() reports it.
+    auto badUrl = client.withUrl("https://example.com/").buildRequest();
+    ASSERT_FALSE(badUrl);
+    EXPECT_EQ(badUrl.error(), Errc::schemeMismatch);
 }
 
 TEST(WebClient, ReusesKeepAliveConnection)
@@ -175,7 +187,7 @@ TEST(WebClient, ReusesKeepAliveConnection)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
@@ -184,8 +196,9 @@ TEST(WebClient, ReusesKeepAliveConnection)
         {
             WebClient client(pool);
             auto res = co_await client.withUrl(url + "/hello").execute();
-            EXPECT_EQ(res.result(), http::status::ok);
-            EXPECT_EQ(res.body(), "world");
+            CO_REQUIRE_OK(res);
+            EXPECT_EQ(res->result(), http::status::ok);
+            EXPECT_EQ(res->body(), "world");
         }
         EndpointKey key{"127.0.0.1",
                         std::to_string(server.localEndpoint().port()), false};
@@ -202,7 +215,7 @@ TEST(WebClient, ConnectionCloseIsNotReused)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
@@ -211,7 +224,8 @@ TEST(WebClient, ConnectionCloseIsNotReused)
         {
             WebClient client(pool);
             auto res = co_await client.withUrl(url + "/close").execute();
-            EXPECT_EQ(res.body(), "bye");
+            CO_REQUIRE_OK(res);
+            EXPECT_EQ(res->body(), "bye");
         }
         EndpointKey key{"127.0.0.1",
                         std::to_string(server.localEndpoint().port()), false};
@@ -227,7 +241,7 @@ TEST(WebClient, IdleConnectionsExpire)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     ConnectionPoolConfig config;
     config.idleTimeout = 50ms;
     auto pool = HttpConnectionPool::create(ioc.get_executor(), nullptr, config);
@@ -236,11 +250,13 @@ TEST(WebClient, IdleConnectionsExpire)
     auto body = [&]() -> Task<void> {
         WebClient client(pool);
         client.withUrl(url + "/hello");
-        co_await client.execute();
+        auto first = co_await client.execute();
+        CO_REQUIRE_OK(first);
         net::steady_timer timer(ioc);
         timer.expires_after(120ms);
         co_await timer.async_wait(useSenderNoThrow);
-        co_await client.execute();
+        auto second = co_await client.execute();
+        CO_REQUIRE_OK(second);
     };
     runClient(ioc, server, body);
     EXPECT_EQ(seen.remotePorts.size(), 2u);
@@ -255,7 +271,7 @@ TEST(WebClient, PeerClosedIdleConnectionIsDropped)
     // The server drops idle keep-alive connections quickly.
     options.requestTimeout = 50ms;
     HttpServer server(ioc.get_executor(), loopback(), router, options);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
@@ -263,12 +279,14 @@ TEST(WebClient, PeerClosedIdleConnectionIsDropped)
         WebClient client(pool);
         client.withUrl(url + "/hello");
         auto first = co_await client.execute();
-        EXPECT_EQ(first.body(), "world");
+        CO_REQUIRE_OK(first);
+        EXPECT_EQ(first->body(), "world");
         net::steady_timer timer(ioc);
         timer.expires_after(200ms);
         co_await timer.async_wait(useSenderNoThrow);
         auto second = co_await client.execute();
-        EXPECT_EQ(second.body(), "world");
+        CO_REQUIRE_OK(second);
+        EXPECT_EQ(second->body(), "world");
     };
     runClient(ioc, server, body);
     EXPECT_EQ(seen.remotePorts.size(), 2u);
@@ -280,7 +298,7 @@ TEST(WebClient, LimitsConnectionsPerHostAndWaits)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     ConnectionPoolConfig config;
     config.maxConnectionsPerHost = 2;
     auto pool = HttpConnectionPool::create(ioc.get_executor(), nullptr, config);
@@ -293,7 +311,8 @@ TEST(WebClient, LimitsConnectionsPerHostAndWaits)
     auto worker = [&](int) -> Task<void> {
         WebClient client(pool);
         auto res = co_await client.withUrl(url + "/slow").execute();
-        EXPECT_EQ(res.body(), "slow");
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->body(), "slow");
         ++completed;
     };
     auto body = [&]() -> Task<void> {
@@ -321,7 +340,7 @@ TEST(WebClient, AcquireTimesOutWhenPoolIsExhausted)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     ConnectionPoolConfig config;
     config.maxConnectionsPerHost = 1;
     config.acquireTimeout = 30ms;
@@ -331,7 +350,8 @@ TEST(WebClient, AcquireTimesOutWhenPoolIsExhausted)
     bool timedOut = false;
     auto slow = [&]() -> Task<void> {
         WebClient client(pool);
-        co_await client.withUrl(url + "/slow").execute();
+        auto res = co_await client.withUrl(url + "/slow").execute();
+        EXPECT_TRUE(res);
     };
     auto body = [&]() -> Task<void> {
         exec::async_scope scope;
@@ -339,16 +359,11 @@ TEST(WebClient, AcquireTimesOutWhenPoolIsExhausted)
         net::steady_timer timer(ioc);
         timer.expires_after(10ms);
         co_await timer.async_wait(useSenderNoThrow);
-        try
-        {
-            WebClient client(pool);
+        WebClient client(pool);
+        auto res =
             co_await client.withUrl(url + "/hello").withRetries(1).execute();
-        }
-        catch (const system_error& e)
-        {
-            timedOut = e.code() ==
-                       make_error_code(boost::system::errc::timed_out);
-        }
+        timedOut = !res && res.error() ==
+                               make_error_code(boost::system::errc::timed_out);
         co_await scope.on_empty();
     };
     runClient(ioc, server, body);
@@ -361,7 +376,7 @@ TEST(WebClient, RetriesServerErrorsOfIdempotentRequests)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
     WebClient::RetryPolicy policy;
@@ -373,8 +388,9 @@ TEST(WebClient, RetriesServerErrorsOfIdempotentRequests)
         auto res = co_await client.withUrl(url + "/flaky")
                        .withRetryPolicy(policy)
                        .execute();
-        EXPECT_EQ(res.result(), http::status::ok);
-        EXPECT_EQ(res.body(), "recovered");
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::ok);
+        EXPECT_EQ(res->body(), "recovered");
 
         // POST is not idempotent: the 503 is returned after one attempt.
         WebClient post(pool);
@@ -382,7 +398,8 @@ TEST(WebClient, RetriesServerErrorsOfIdempotentRequests)
                         .withMethod(http::verb::post)
                         .withRetryPolicy(policy)
                         .execute();
-        EXPECT_EQ(res2.result(), http::status::service_unavailable);
+        CO_REQUIRE_OK(res2);
+        EXPECT_EQ(res2->result(), http::status::service_unavailable);
     };
     runClient(ioc, server, body);
     EXPECT_EQ(seen.flakyCalls, 3);
@@ -395,7 +412,7 @@ TEST(WebClient, ReturnsLastServerErrorWhenRetriesRunOut)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
     WebClient::RetryPolicy policy;
@@ -409,13 +426,14 @@ TEST(WebClient, ReturnsLastServerErrorWhenRetriesRunOut)
         auto res = co_await client.withUrl(url + "/flaky")
                        .withRetryPolicy(policy)
                        .execute();
-        EXPECT_EQ(res.result(), http::status::service_unavailable);
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->result(), http::status::service_unavailable);
     };
     runClient(ioc, server, body);
     EXPECT_EQ(seen.flakyCalls, 2);
 }
 
-TEST(WebClient, ConnectFailureIsRetriedThenThrown)
+TEST(WebClient, ConnectFailureIsRetriedThenReported)
 {
     net::io_context ioc;
     // Find a port nothing listens on.
@@ -433,17 +451,11 @@ TEST(WebClient, ConnectFailureIsRetriedThenThrown)
     exec::async_scope scope;
     auto body = [&]() -> Task<void> {
         WebClient client(pool);
-        try
-        {
-            co_await client
-                .withUrl("http://127.0.0.1:" + std::to_string(freePort))
-                .withRetryPolicy(policy)
-                .execute();
-        }
-        catch (const system_error& e)
-        {
-            refused = e.code() == net::error::connection_refused;
-        }
+        auto res = co_await client
+                       .withUrl("http://127.0.0.1:" + std::to_string(freePort))
+                       .withRetryPolicy(policy)
+                       .execute();
+        refused = !res && res.error() == net::error::connection_refused;
         EndpointKey key{"127.0.0.1", std::to_string(freePort), false};
         EXPECT_EQ(pool->activeCount(key), 0u);
     };
@@ -458,7 +470,7 @@ TEST(WebClient, PostsJsonAndEncodesParams)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
@@ -468,13 +480,15 @@ TEST(WebClient, PostsJsonAndEncodesParams)
                        .withMethod(http::verb::post)
                        .withJsonBody({{"n", 1}})
                        .execute();
-        EXPECT_EQ(res.body(), R"(application/json|{"n":1})");
+        CO_REQUIRE_OK(res);
+        EXPECT_EQ(res->body(), R"(application/json|{"n":1})");
 
         WebClient query(pool);
         auto echoed = co_await query.withUrl(url + "/echo")
                           .withParams({{"a", "x y"}, {"b", "&="}})
                           .execute();
-        EXPECT_EQ(echoed.body(), "x y|&=");
+        CO_REQUIRE_OK(echoed);
+        EXPECT_EQ(echoed->body(), "x y|&=");
     };
     runClient(ioc, server, body);
 }
@@ -485,7 +499,7 @@ TEST(WebClient, StreamsServerSentEvents)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
@@ -493,11 +507,13 @@ TEST(WebClient, StreamsServerSentEvents)
     http::status status = http::status::unknown;
     auto body = [&]() -> Task<void> {
         WebClient client(pool);
-        status = co_await client.withUrl(url + "/events")
-                     .executeAsStream([&](std::string data) {
-                         events.push_back(std::move(data));
-                         return true;
-                     });
+        auto result = co_await client.withUrl(url + "/events")
+                          .executeAsStream([&](std::string data) {
+                              events.push_back(std::move(data));
+                              return true;
+                          });
+        CO_REQUIRE_OK(result);
+        status = *result;
         EndpointKey key{"127.0.0.1",
                         std::to_string(server.localEndpoint().port()), false};
         // A streaming connection is never returned to the pool.
@@ -515,18 +531,19 @@ TEST(WebClient, StreamStopsWhenHandlerReturnsFalse)
     Observed seen;
     auto router = makeRouter(ioc, seen);
     HttpServer server(ioc.get_executor(), loopback(), router);
-    server.start();
+    ASSERT_TRUE(server.start());
     auto pool = HttpConnectionPool::create(ioc.get_executor());
     const auto url = baseUrl(server);
 
     std::vector<std::string> events;
     auto body = [&]() -> Task<void> {
         WebClient client(pool);
-        co_await client.withUrl(url + "/events")
-            .executeAsStream([&](std::string data) {
-                events.push_back(std::move(data));
-                return false;
-            });
+        auto result = co_await client.withUrl(url + "/events")
+                          .executeAsStream([&](std::string data) {
+                              events.push_back(std::move(data));
+                              return false;
+                          });
+        EXPECT_TRUE(result);
     };
     runClient(ioc, server, body);
     EXPECT_EQ(events, (std::vector<std::string>{"tick 0"}));
@@ -537,12 +554,16 @@ TEST(SecureWebClient, VerifiedRoundTripAndReuse)
     net::io_context ioc;
     Observed seen;
     auto pem = generateSelfSignedCertificate("localhost");
-    auto serverContext = makeServerContext(pem.certificate, pem.privateKey);
-    auto clientContext = makeClientContext(pem.certificate);
+    ASSERT_TRUE(pem);
+    auto serverContext = makeServerContext(pem->certificate, pem->privateKey);
+    auto clientContext = makeClientContext(pem->certificate);
+    ASSERT_TRUE(serverContext);
+    ASSERT_TRUE(clientContext);
     auto router = makeRouter(ioc, seen);
-    HttpServer server(ioc.get_executor(), loopback(), router, serverContext);
-    server.start();
-    auto pool = HttpsConnectionPool::create(ioc.get_executor(), &clientContext);
+    HttpServer server(ioc.get_executor(), loopback(), router, *serverContext);
+    ASSERT_TRUE(server.start());
+    auto pool =
+        HttpsConnectionPool::create(ioc.get_executor(), &*clientContext);
     const auto port = std::to_string(server.localEndpoint().port());
 
     auto body = [&]() -> Task<void> {
@@ -552,7 +573,8 @@ TEST(SecureWebClient, VerifiedRoundTripAndReuse)
             auto res =
                 co_await client.withUrl("https://localhost:" + port + "/hello")
                     .execute();
-            EXPECT_EQ(res.body(), "world");
+            CO_REQUIRE_OK(res);
+            EXPECT_EQ(res->body(), "world");
         }
         EndpointKey key{"localhost", port, true};
         EXPECT_EQ(pool->idleCount(key), 1u);
@@ -566,36 +588,37 @@ TEST(SecureWebClient, UntrustedServerIsRejectedWithoutRetry)
     net::io_context ioc;
     Observed seen;
     auto pem = generateSelfSignedCertificate("localhost");
-    auto serverContext = makeServerContext(pem.certificate, pem.privateKey);
     auto other = generateSelfSignedCertificate("localhost");
-    auto clientContext = makeClientContext(other.certificate);
+    ASSERT_TRUE(pem);
+    ASSERT_TRUE(other);
+    auto serverContext = makeServerContext(pem->certificate, pem->privateKey);
+    auto clientContext = makeClientContext(other->certificate);
+    ASSERT_TRUE(serverContext);
+    ASSERT_TRUE(clientContext);
     auto router = makeRouter(ioc, seen);
-    HttpServer server(ioc.get_executor(), loopback(), router, serverContext);
-    server.start();
-    auto pool = HttpsConnectionPool::create(ioc.get_executor(), &clientContext);
+    HttpServer server(ioc.get_executor(), loopback(), router, *serverContext);
+    ASSERT_TRUE(server.start());
+    auto pool =
+        HttpsConnectionPool::create(ioc.get_executor(), &*clientContext);
     const auto port = std::to_string(server.localEndpoint().port());
 
-    int attempts = 0;
     bool rejected = false;
+    bool tlsError = false;
     exec::async_scope scope;
     auto body = [&]() -> Task<void> {
         SecureWebClient client(pool);
-        try
-        {
+        auto res =
             co_await client.withUrl("https://localhost:" + port + "/hello")
                 .withRetries(3)
                 .execute();
-        }
-        catch (const system_error& e)
-        {
-            rejected = true;
-            attempts = e.code().category() == net::error::get_ssl_category();
-        }
+        rejected = !res;
+        tlsError = !res &&
+                   res.error().category() == net::error::get_ssl_category();
         server.stop();
     };
     spawnTask(scope, body(), "untrusted");
     ioc.run();
     EXPECT_TRUE(rejected);
     // The failure is a TLS verification error, which is not retried.
-    EXPECT_EQ(attempts, 1);
+    EXPECT_TRUE(tlsError);
 }
